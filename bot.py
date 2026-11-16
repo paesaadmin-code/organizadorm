@@ -7,12 +7,27 @@ import dateparser
 import json
 import os
 import tempfile
-
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import os
 from google import genai
 from google.genai import types
 from collections import defaultdict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+
+# --- SERVIDOR FANTASMA PARA RENDER (GRATIS) ---
+class ServidorFantasma(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot de Telegram Activo y Escuchando!")
+
+def iniciar_servidor():
+    puerto = int(os.environ.get("PORT", 10000)) # Render asignará este puerto
+    servidor = HTTPServer(('0.0.0.0', puerto), ServidorFantasma)
+    servidor.serve_forever()
 
 # --- CONFIGURACIÓN DE CLAVES ---
 TOKEN = '9156918216:AAG4dC_F7iB3SGiq1IsXrevJAbFIHD0iLIo'
