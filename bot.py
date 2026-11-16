@@ -163,9 +163,14 @@ async def procesar_texto_libre_ia(update: Update, context: ContextTypes.DEFAULT_
         respuesta = chat_ia.send_message(texto)
         await procesar_respuesta_ia(context.bot, MI_TELEGRAM_ID, respuesta.text)
     except Exception as e:
-        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="⏳ *Servidores de IA ocupados.* Por favor, usa los botones del Menú Manual.", parse_mode='Markdown', reply_markup=obtener_menu_principal())
+        error_real = str(e)
+        if "503" in error_real or "UNAVAILABLE" in error_real:
+            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="⏳ *Servidores de IA saturados momentáneamente.*", parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"⚠️ *Error técnico de IA:* {error_real}\n\nUsa el menú manual por ahora.", parse_mode='Markdown')
     finally:
-        await m.delete()
+        try: await m.delete()
+        except: pass
 
 async def procesar_audio_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MI_TELEGRAM_ID: return
@@ -182,9 +187,14 @@ async def procesar_audio_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cliente_ia.files.delete(name=archivo_gemini.name)
             os.remove(temp_audio.name)
     except Exception as e:
-        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="⏳ *Servidores de IA ocupados.* Por favor, usa el Menú Manual.", parse_mode='Markdown', reply_markup=obtener_menu_principal())
+        error_real = str(e)
+        if "503" in error_real or "UNAVAILABLE" in error_real:
+            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="⏳ *Servidores de IA saturados momentáneamente.*", parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"⚠️ *Error técnico de IA:* {error_real}\n\nUsa el menú manual por ahora.", parse_mode='Markdown')
     finally:
-        await m.delete()
+        try: await m.delete()
+        except: pass
 
 async def procesar_foto_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MI_TELEGRAM_ID: return
@@ -201,9 +211,14 @@ async def procesar_foto_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cliente_ia.files.delete(name=archivo_gemini.name)
             os.remove(temp_foto.name)
     except Exception as e:
-        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="⏳ *Servidores de IA ocupados.* Por favor, usa el Menú Manual.", parse_mode='Markdown', reply_markup=obtener_menu_principal())
+        error_real = str(e)
+        if "503" in error_real or "UNAVAILABLE" in error_real:
+            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="⏳ *Servidores de IA saturados momentáneamente.*", parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"⚠️ *Error técnico de IA:* {error_real}\n\nUsa el menú manual por ahora.", parse_mode='Markdown')
     finally:
-        await m.delete()
+        try: await m.delete()
+        except: pass
 
 # ==========================================
 # MENÚS GENERALES Y BALANCE
