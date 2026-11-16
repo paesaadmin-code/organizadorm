@@ -1,6 +1,6 @@
 import logging
 import asyncio
-import sqlite3
+import psycopg2
 import datetime
 from zoneinfo import ZoneInfo
 import dateparser
@@ -18,34 +18,52 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 TOKEN = '9156918216:AAG4dC_F7iB3SGiq1IsXrevJAbFIHD0iLIo'
 MI_TELEGRAM_ID = 6612216260
 GEMINI_API_KEY = 'AQ.Ab8RN6K_dcsTxsYsc_y4yke47Kogk-ZcpTGHnBrncQLaC9FbrQ'
+DATABASE_URL = 'postgresql://neondb_owner:npg_zPubRs28rxml@ep-plain-bar-bfya12gv-pooler.c-5.us-west-2.aws.neon.tech/neondb?sslmode=require'
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-datos_usuario = {}
-T_DESCRIPCION, T_TIPO, T_PRIORIDAD, T_FECHA, T_NOTAS = range(5)
-F_AREA, F_CONCEPTO, F_MONTO, F_METODO, F_FECHA = range(5, 10)
+# --- CARGAR PLANIFICADOR DE TAREAS ---
+try:
+    with open('Planificador de tareas.txt', 'r', encoding='utf-8') as f:
+        planificador_contexto = f.read()
+except FileNotFoundError:
+    planificador_contexto = "El usuario no ha subido el archivo. Actúa con sentido común."
 
-# --- CONFIGURACIÓN DE IA (NUEVA VERSIÓN GENAI) ---
+# --- CONFIGURACIÓN DE IA CON MEMORIA ---
 cliente_ia = genai.Client(api_key=GEMINI_API_KEY)
 
-instruccion_sistema = """
-Eres un asistente personal organizador inteligente. Analiza la entrada del usuario (texto, audio o ticket).
-Toma en cuenta su "Planificador de tareas" para entender su contexto corporativo y personal.
-Clasifica la entrada como 'tarea' o 'finanza' y devuelve ÚNICAMENTE un objeto JSON válido sin texto adicional ni formato markdown.
-Formato Tarea: {"tipo_registro": "tarea", "descripcion": "string", "tipo": "Empresa" o "Personal", "prioridad": "Urgente" o "Rutina", "fecha_original": "string", "notas": "string"}
-Formato Finanza: {"tipo_registro": "finanza", "tipo": "Gasto" o "Ingreso", "area": "Empresa" o "Personal", "concepto": "string", "monto": numero_float, "metodo": "Tarjeta" o "Efectivo", "fecha": "string"}
+instruccion_sistema = f"""
+Eres un asistente personal organizador inteligente con memoria de conversación. Analiza la entrada del usuario (texto, audio o ticket).
+Toma en cuenta su documento "Planificador de tareas" para entender su contexto:
+
+--- INICIO PLANIFICADOR ---
+{planificador_contexto}
+--- FIN PLANIFICADOR ---
+
+REGLA 1 (APRENDIZAJE): Si el usuario te pide registrar algo que es ambiguo, le falta el monto/fecha, o no encaja en las categorías del Planificador, NO generes JSON. En su lugar, respóndele en texto plano con una pregunta breve y directa para aclarar la duda (Ej. "¿Esto es gasto personal o de la empresa?").
+REGLA 2 (GUARDADO): Si ya tienes toda la información clara (ya sea de inicio o porque el usuario te acaba de responder la duda), devuelve ÚNICAMENTE un objeto JSON válido, sin comillas invertidas ni texto adicional.
+
+Formato Tarea: {{"tipo_registro": "tarea", "descripcion": "string", "tipo": "Empresa" o "Personal", "prioridad": "Urgente" o "Rutina", "fecha_original": "string", "notas": "string"}}
+Formato Finanza: {{"tipo_registro": "finanza", "tipo": "Gasto" o "Ingreso", "area": "Empresa" o "Personal", "concepto": "string", "monto": numero_float, "metodo": "Tarjeta" o "Efectivo", "fecha": "string"}}
 """
 config_ia = types.GenerateContentConfig(system_instruction=instruccion_sistema)
 
+# Creamos una sesión de chat global para que la IA recuerde la conversación
+chat_ia = cliente_ia.chats.create(model='gemini-1.5-flash', config=config_ia)
+
 # ==========================================
-# 1. BASE DE DATOS
+# 1. BASE DE DATOS (POSTGRESQL NEON)
 # ==========================================
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
 def init_db():
-    conn = sqlite3.connect('mi_vida.db')
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS tareas (id INTEGER PRIMARY KEY AUTOINCREMENT, descripcion TEXT, tipo TEXT, prioridad TEXT, fecha_original TEXT, fecha_calculada DATE, notas TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS finanzas (id INTEGER PRIMARY KEY AUTOINCREMENT, tipo TEXT, area TEXT, concepto TEXT, monto REAL, metodo TEXT, fecha DATE)''')
+    # Usamos TEXT para fechas calculadas para mayor flexibilidad
+    c.execute('''CREATE TABLE IF NOT EXISTS tareas (id SERIAL PRIMARY KEY, descripcion TEXT, tipo TEXT, prioridad TEXT, fecha_original TEXT, fecha_calculada TEXT, notas TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS finanzas (id SERIAL PRIMARY KEY, tipo TEXT, area TEXT, concepto TEXT, monto REAL, metodo TEXT, fecha TEXT)''')
     conn.commit()
     conn.close()
 
@@ -53,20 +71,20 @@ init_db()
 
 def obtener_menu_principal():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📝 Tareas (Menú)", callback_data='menu_tarea')],
-        [InlineKeyboardButton("💰 Finanzas (Menú)", callback_data='menu_finanzas')],
+        [InlineKeyboardButton("📝 Tareas (Manual)", callback_data='menu_tarea')],
+        [InlineKeyboardButton("💰 Finanzas (Manual)", callback_data='menu_finanzas')],
         [InlineKeyboardButton("📅 Ver Calendario", callback_data='ver_calendario')],
         [InlineKeyboardButton("⏱️ Modo Enfoque", callback_data='modo_enfoque')]
     ])
 
 # ==========================================
-# 2. MOTOR DE ALERTAS AUTOMÁTICAS (NATIVO)
+# 2. MOTOR DE ALERTAS AUTOMÁTICAS
 # ==========================================
 async def alerta_matutina(context: ContextTypes.DEFAULT_TYPE):
     hoy = datetime.date.today().strftime('%Y-%m-%d')
-    conn = sqlite3.connect('mi_vida.db')
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT descripcion, tipo, prioridad FROM tareas WHERE fecha_calculada = ?", (hoy,))
+    c.execute("SELECT descripcion, tipo, prioridad FROM tareas WHERE fecha_calculada = %s", (hoy,))
     tareas_hoy = c.fetchall()
     conn.close()
 
@@ -76,59 +94,56 @@ async def alerta_matutina(context: ContextTypes.DEFAULT_TYPE):
     else:
         for t in tareas_hoy:
             mensaje += f"▫️ {t[0]} ({t[1]} - {t[2]})\n"
-        mensaje += "\n🤖 *Consejo de tu IA:* Enfócate en las tareas Urgentes primero para asegurar el cumplimiento del Planificador."
-
+        mensaje += "\n🤖 *IA:* Enfócate en las tareas Urgentes primero."
     await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=mensaje, parse_mode='Markdown')
 
 async def alerta_nocturna(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="🌙 *Corte de caja.* \nMomento de revisar pendientes y desconectar. ¿Cómo te fue hoy?", parse_mode='Markdown')
 
 # ==========================================
-# 3. PROCESAMIENTO DE IA (TEXTO, AUDIO Y FOTOS)
+# 3. PROCESAMIENTO DE IA CON MEMORIA
 # ==========================================
-async def procesar_json_ia(bot, chat_id, respuesta_ia):
-    try:
-        texto_json = respuesta_ia.replace('```json', '').replace('```', '').strip()
-        datos = json.loads(texto_json)
-        
-        conn = sqlite3.connect('mi_vida.db')
-        c = conn.cursor()
-        
-        if datos.get('tipo_registro') == 'tarea':
-            fecha_calc = dateparser.parse(datos['fecha_original'], languages=['es'])
-            fecha_str = fecha_calc.strftime('%Y-%m-%d') if fecha_calc else "Recurrente"
-            c.execute("INSERT INTO tareas (descripcion, tipo, prioridad, fecha_original, fecha_calculada, notas) VALUES (?, ?, ?, ?, ?, ?)",
-                      (datos['descripcion'], datos['tipo'], datos['prioridad'], datos['fecha_original'], fecha_str, datos.get('notas', '')))
-            mensaje = f"✅ *Tarea guardada con IA*\n📌 {datos['descripcion']}\n⏰ Para: {fecha_str} ({datos['tipo']})"
+async def procesar_respuesta_ia(bot, chat_id, respuesta_texto):
+    texto_limpio = respuesta_texto.replace('```json', '').replace('```', '').strip()
+    
+    # Si la IA respondió con JSON, lo guardamos en la base de datos
+    if texto_limpio.startswith('{') and texto_limpio.endswith('}'):
+        try:
+            datos = json.loads(texto_limpio)
+            conn = get_db_connection()
+            c = conn.cursor()
             
-        elif datos.get('tipo_registro') == 'finanza':
-            fecha_calc = dateparser.parse(datos['fecha'], languages=['es'])
-            fecha_str = fecha_calc.strftime('%Y-%m-%d') if fecha_calc else datetime.date.today().strftime('%Y-%m-%d')
-            c.execute("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha) VALUES (?, ?, ?, ?, ?, ?)",
-                      (datos['tipo'], datos['area'], datos['concepto'], datos['monto'], datos['metodo'], fecha_str))
-            mensaje = f"✅ *Finanza guardada con IA*\n💰 {datos['tipo']}: ${datos['monto']} en {datos['concepto']} ({datos['area']})"
-        else:
-            mensaje = "⚠️ La IA no pudo clasificar correctamente el mensaje."
-
-        conn.commit()
-        conn.close()
-        await bot.send_message(chat_id=chat_id, text=mensaje, parse_mode='Markdown', reply_markup=obtener_menu_principal())
-
-    except Exception as e:
-        await bot.send_message(chat_id=chat_id, text=f"❌ Error al procesar con IA. Usa el menú manual.\nDetalle: {e}")
+            if datos.get('tipo_registro') == 'tarea':
+                fecha_calc = dateparser.parse(datos.get('fecha_original', ''), languages=['es'])
+                fecha_str = fecha_calc.strftime('%Y-%m-%d') if fecha_calc else "Recurrente"
+                c.execute("INSERT INTO tareas (descripcion, tipo, prioridad, fecha_original, fecha_calculada, notas) VALUES (%s, %s, %s, %s, %s, %s)",
+                          (datos.get('descripcion'), datos.get('tipo'), datos.get('prioridad'), datos.get('fecha_original'), fecha_str, datos.get('notas', '')))
+                mensaje = f"✅ *Tarea guardada con IA*\n📌 {datos.get('descripcion')}\n⏰ Para: {fecha_str} ({datos.get('tipo')})"
+                
+            elif datos.get('tipo_registro') == 'finanza':
+                fecha_calc = dateparser.parse(datos.get('fecha', ''), languages=['es'])
+                fecha_str = fecha_calc.strftime('%Y-%m-%d') if fecha_calc else datetime.date.today().strftime('%Y-%m-%d')
+                c.execute("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha) VALUES (%s, %s, %s, %s, %s, %s)",
+                          (datos.get('tipo'), datos.get('area'), datos.get('concepto'), datos.get('monto'), datos.get('metodo'), fecha_str))
+                mensaje = f"✅ *Finanza guardada con IA*\n💰 {datos.get('tipo')}: ${datos.get('monto')} en {datos.get('concepto')} ({datos.get('area')})"
+            
+            conn.commit()
+            conn.close()
+            await bot.send_message(chat_id=chat_id, text=mensaje, parse_mode='Markdown', reply_markup=obtener_menu_principal())
+            return
+        except Exception as e:
+            pass # Si falla el JSON, cae en el bloque de texto libre de abajo
+            
+    # Si la IA no respondió con JSON, es una PREGUNTA o duda (Memoria activada)
+    await bot.send_message(chat_id=chat_id, text=f"🤖 {respuesta_texto}", parse_mode='Markdown')
 
 async def procesar_texto_libre_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MI_TELEGRAM_ID: return
     texto = update.message.text
-    if datos_usuario.get('esperando_nombre'):
-        datos_usuario['nombre'] = texto
-        datos_usuario['esperando_nombre'] = False
-        await update.message.reply_text(f"¡Listo, {texto}! Aquí tienes tu menú:", reply_markup=obtener_menu_principal())
-        return
-
     m = await update.message.reply_text("🧠 *Pensando...*", parse_mode='Markdown')
-    respuesta = cliente_ia.models.generate_content(model='gemini-1.5-flash', contents=texto, config=config_ia)
-    await procesar_json_ia(context.bot, MI_TELEGRAM_ID, respuesta.text)
+    # Enviar al chat con memoria
+    respuesta = chat_ia.send_message(texto)
+    await procesar_respuesta_ia(context.bot, MI_TELEGRAM_ID, respuesta.text)
     await m.delete()
 
 async def procesar_audio_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,14 +153,11 @@ async def procesar_audio_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     archivo = await context.bot.get_file(update.message.voice.file_id)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as temp_audio:
         await archivo.download_to_drive(temp_audio.name)
-        
         archivo_gemini = cliente_ia.files.upload(file=temp_audio.name, config={'mime_type': 'audio/ogg'})
-        respuesta = cliente_ia.models.generate_content(
-            model='gemini-1.5-flash',
-            contents=[archivo_gemini, "Analiza este audio y extrae los datos."],
-            config=config_ia
-        )
-        await procesar_json_ia(context.bot, MI_TELEGRAM_ID, respuesta.text)
+        
+        # Enviar audio al chat con memoria
+        respuesta = chat_ia.send_message([archivo_gemini, "Extrae los datos de este audio. Si te falta información, pregúntame."])
+        await procesar_respuesta_ia(context.bot, MI_TELEGRAM_ID, respuesta.text)
         
         cliente_ia.files.delete(name=archivo_gemini.name)
         os.remove(temp_audio.name)
@@ -158,29 +170,21 @@ async def procesar_foto_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     archivo = await context.bot.get_file(update.message.photo[-1].file_id)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_foto:
         await archivo.download_to_drive(temp_foto.name)
-        
         archivo_gemini = cliente_ia.files.upload(file=temp_foto.name, config={'mime_type': 'image/jpeg'})
-        respuesta = cliente_ia.models.generate_content(
-            model='gemini-1.5-flash',
-            contents=[archivo_gemini, "Lee este ticket o foto y extrae los datos del gasto."],
-            config=config_ia
-        )
-        await procesar_json_ia(context.bot, MI_TELEGRAM_ID, respuesta.text)
+        
+        respuesta = chat_ia.send_message([archivo_gemini, "Extrae los datos de este ticket. Si te falta saber si es de empresa o personal, pregúntame."])
+        await procesar_respuesta_ia(context.bot, MI_TELEGRAM_ID, respuesta.text)
         
         cliente_ia.files.delete(name=archivo_gemini.name)
         os.remove(temp_foto.name)
     await m.delete()
 
 # ==========================================
-# 4. FLUJOS MANUALES
+# 4. MANEJADOR DE MENÚS Y BALANCE
 # ==========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_user.id != MI_TELEGRAM_ID: return ConversationHandler.END
-    if not datos_usuario.get('nombre'):
-        datos_usuario['esperando_nombre'] = True
-        await update.message.reply_text("¡Hola! Antes de iniciar, ¿cómo quieres que me dirija a ti?")
-        return ConversationHandler.END
-    await update.message.reply_text(f"¡Qué tal, {datos_usuario['nombre']}!\nPuedes enviarme audios, fotos de tickets, escribir directo, o usar el menú:", reply_markup=obtener_menu_principal())
+    await update.message.reply_text("¡Hola! Háblame, mándame fotos o usa el menú:", reply_markup=obtener_menu_principal())
     return ConversationHandler.END
 
 async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -189,17 +193,16 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await query.answer() 
 
     if query.data == 'menu_tarea':
-        await query.edit_message_text("Módulo de Tareas. ¿Qué haremos?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Registrar manual", callback_data='tarea_nueva')], [InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]))
+        await query.edit_message_text("Módulo de Tareas. ¿Qué haremos?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]))
     elif query.data == 'menu_finanzas':
         teclado = [
-            [InlineKeyboardButton("💸 Gasto Manual", callback_data='finanza_gasto'), InlineKeyboardButton("💵 Ingreso Manual", callback_data='finanza_ingreso')],
             [InlineKeyboardButton("📊 Balance Histórico", callback_data='ver_balance_todo')],
             [InlineKeyboardButton("📅 Resumen del Mes", callback_data='ver_balance_mes')],
             [InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]
         ]
         await query.edit_message_text("Módulo Financiero:", reply_markup=InlineKeyboardMarkup(teclado))
     elif query.data == 'ver_calendario':
-        conn = sqlite3.connect('mi_vida.db')
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute("SELECT descripcion, tipo, prioridad, fecha_calculada FROM tareas ORDER BY fecha_calculada ASC")
         tareas = c.fetchall()
@@ -207,7 +210,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if not tareas: mensaje = "📅 *Tu Calendario está vacío.*"
         else:
             tareas_por_dia = defaultdict(list)
-            for t in tareas: tareas_por_dia[t[3] if t[3] else "Recurrentes"].append(t)
+            for t in tareas: tareas_por_dia[t[3]].append(t)
             mensaje = "📅 *TU AGENDA:*\n\n"
             for dia, lista_tareas in tareas_por_dia.items():
                 mensaje += f"🗓️ *{dia}*\n"
@@ -215,11 +218,12 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text(mensaje, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]))
     elif query.data.startswith('ver_balance_'):
         filtro = query.data.split('_')[2]
-        conn = sqlite3.connect('mi_vida.db')
+        conn = get_db_connection()
         c = conn.cursor()
         if filtro == 'mes':
             mes_actual = datetime.datetime.now().strftime('%Y-%m')
-            c.execute("SELECT tipo, area, monto FROM finanzas WHERE strftime('%Y-%m', fecha) = ?", (mes_actual,))
+            # Sintaxis adaptada a PostgreSQL
+            c.execute("SELECT tipo, area, monto FROM finanzas WHERE fecha LIKE %s", (f"{mes_actual}-%",))
             titulo = f"📊 *BALANCE DEL MES ({mes_actual})*\n\n"
         else:
             c.execute("SELECT tipo, area, monto FROM finanzas")
@@ -234,13 +238,13 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text(mensaje, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='menu_finanzas')]]))
     elif query.data == 'modo_enfoque':
         teclado = [[InlineKeyboardButton("25m", callback_data='start_enfoque_25'), InlineKeyboardButton("45m", callback_data='start_enfoque_45'), InlineKeyboardButton("60m", callback_data='start_enfoque_60')], [InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]
-        await query.edit_message_text("⏱️ *Modo Enfoque*\nElige el tiempo de trabajo profundo:", reply_markup=InlineKeyboardMarkup(teclado), parse_mode='Markdown')
+        await query.edit_message_text("⏱️ *Modo Enfoque*\nElige el tiempo:", reply_markup=InlineKeyboardMarkup(teclado), parse_mode='Markdown')
     elif query.data.startswith('start_enfoque_'):
         minutos = int(query.data.split('_')[2])
-        await query.edit_message_text(f"⏱️ *Enfoque activo: {minutos} minutos.*\n¡Silencia distracciones!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏹️ Finalizar por Urgencia", callback_data='cancelar_enfoque')]]), parse_mode='Markdown')
+        await query.edit_message_text(f"⏱️ *Enfoque activo: {minutos} minutos.*\n¡A trabajar!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏹️ Finalizar", callback_data='cancelar_enfoque')]]), parse_mode='Markdown')
         async def temp():
             await asyncio.sleep(minutos * 60)
-            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"🔔 *¡TIEMPO CUMPLIDO ({minutos} min)!* Tómate un descanso.", parse_mode='Markdown')
+            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"🔔 *¡TIEMPO CUMPLIDO ({minutos} min)!* Descansa.", parse_mode='Markdown')
         context.user_data['tarea_enfoque'] = asyncio.create_task(temp())
     elif query.data == 'cancelar_enfoque':
         if 'tarea_enfoque' in context.user_data: context.user_data['tarea_enfoque'].cancel()
@@ -254,19 +258,15 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # 1. Configurar el Reloj Interno usando JobQueue de Telegram (Eliminamos APScheduler)
     zona_horaria = ZoneInfo('America/Monterrey')
     app.job_queue.run_daily(alerta_matutina, time=datetime.time(hour=6, minute=0, tzinfo=zona_horaria))
     app.job_queue.run_daily(alerta_nocturna, time=datetime.time(hour=19, minute=0, tzinfo=zona_horaria))
 
-    # 2. Manejadores de IA
     app.add_handler(MessageHandler(filters.VOICE, procesar_audio_ia))
     app.add_handler(MessageHandler(filters.PHOTO, procesar_foto_ia))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_texto_libre_ia)) 
-
-    # 3. Manejadores Manuales
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(manejador_botones)) 
 
-    print("🤖 Súper Bot iniciado: DB Local + IA Actualizada + Alertas JobQueue.")
+    print("🤖 Súper Bot iniciado: DB PostgreSQL + IA Conversacional + Alertas.")
     app.run_polling()
