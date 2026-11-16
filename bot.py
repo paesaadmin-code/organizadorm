@@ -270,7 +270,14 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ==========================================
 # ARRANQUE DEL BOT
 # ==========================================
+# ==========================================
+# ARRANQUE DEL BOT
+# ==========================================
 if __name__ == '__main__':
+    # 1. Encendemos el puerto web fantasma en un hilo separado para cumplir con Render
+    threading.Thread(target=iniciar_servidor, daemon=True).start()
+
+    # 2. Inicializamos el bot
     app = ApplicationBuilder().token(TOKEN).build()
 
     zona_horaria = ZoneInfo('America/Monterrey')
@@ -283,5 +290,5 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(manejador_botones)) 
 
-    print("🤖 Súper Bot iniciado: DB PostgreSQL + IA Conversacional + Alertas.")
+    print("🤖 Súper Bot iniciado: DB PostgreSQL + IA Conversacional + Alertas + Web Server.")
     app.run_polling()
