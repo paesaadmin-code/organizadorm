@@ -2,15 +2,17 @@ import logging
 import asyncio
 import sqlite3
 import datetime
+from zoneinfo import ZoneInfo
 import dateparser
 import json
 import os
 import tempfile
-import google.generativeai as genai
+
+from google import genai
+from google.genai import types
 from collections import defaultdict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- CONFIGURACIÓN DE CLAVES ---
 TOKEN = '9156918216:AAG4dC_F7iB3SGiq1IsXrevJAbFIHD0iLIo'
@@ -24,8 +26,8 @@ datos_usuario = {}
 T_DESCRIPCION, T_TIPO, T_PRIORIDAD, T_FECHA, T_NOTAS = range(5)
 F_AREA, F_CONCEPTO, F_MONTO, F_METODO, F_FECHA = range(5, 10)
 
-# --- CONFIGURACIÓN DE IA (GEMINI) ---
-genai.configure(api_key=GEMINI_API_KEY)
+# --- CONFIGURACIÓN DE IA (NUEVA VERSIÓN GENAI) ---
+cliente_ia = genai.Client(api_key=GEMINI_API_KEY)
 
 instruccion_sistema = """
 Eres un asistente personal organizador inteligente. Analiza la entrada del usuario (texto, audio o ticket).
@@ -34,7 +36,7 @@ Clasifica la entrada como 'tarea' o 'finanza' y devuelve ÚNICAMENTE un objeto J
 Formato Tarea: {"tipo_registro": "tarea", "descripcion": "string", "tipo": "Empresa" o "Personal", "prioridad": "Urgente" o "Rutina", "fecha_original": "string", "notas": "string"}
 Formato Finanza: {"tipo_registro": "finanza", "tipo": "Gasto" o "Ingreso", "area": "Empresa" o "Personal", "concepto": "string", "monto": numero_float, "metodo": "Tarjeta" o "Efectivo", "fecha": "string"}
 """
-modelo_ia = genai.GenerativeModel('gemini-1.5-flash', system_instruction=instruccion_sistema)
+config_ia = types.GenerateContentConfig(system_instruction=instruccion_sistema)
 
 # ==========================================
 # 1. BASE DE DATOS
@@ -58,9 +60,9 @@ def obtener_menu_principal():
     ])
 
 # ==========================================
-# 2. MOTOR DE ALERTAS AUTOMÁTICAS (Coach IA)
+# 2. MOTOR DE ALERTAS AUTOMÁTICAS (NATIVO)
 # ==========================================
-async def alerta_matutina(bot):
+async def alerta_matutina(context: ContextTypes.DEFAULT_TYPE):
     hoy = datetime.date.today().strftime('%Y-%m-%d')
     conn = sqlite3.connect('mi_vida.db')
     c = conn.cursor()
@@ -76,17 +78,16 @@ async def alerta_matutina(bot):
             mensaje += f"▫️ {t[0]} ({t[1]} - {t[2]})\n"
         mensaje += "\n🤖 *Consejo de tu IA:* Enfócate en las tareas Urgentes primero para asegurar el cumplimiento del Planificador."
 
-    await bot.send_message(chat_id=MI_TELEGRAM_ID, text=mensaje, parse_mode='Markdown')
+    await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=mensaje, parse_mode='Markdown')
 
-async def alerta_nocturna(bot):
-    await bot.send_message(chat_id=MI_TELEGRAM_ID, text="🌙 *Corte de caja.* \nMomento de revisar pendientes y desconectar. ¿Cómo te fue hoy?", parse_mode='Markdown')
+async def alerta_nocturna(context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="🌙 *Corte de caja.* \nMomento de revisar pendientes y desconectar. ¿Cómo te fue hoy?", parse_mode='Markdown')
 
 # ==========================================
 # 3. PROCESAMIENTO DE IA (TEXTO, AUDIO Y FOTOS)
 # ==========================================
 async def procesar_json_ia(bot, chat_id, respuesta_ia):
     try:
-        # Limpiar el formato markdown que a veces pone Gemini
         texto_json = respuesta_ia.replace('```json', '').replace('```', '').strip()
         datos = json.loads(texto_json)
         
@@ -114,7 +115,7 @@ async def procesar_json_ia(bot, chat_id, respuesta_ia):
         await bot.send_message(chat_id=chat_id, text=mensaje, parse_mode='Markdown', reply_markup=obtener_menu_principal())
 
     except Exception as e:
-        await bot.send_message(chat_id=chat_id, text=f"❌ Error al procesar con IA: No se entendió el formato. Usa el menú manual.\nDetalle: {e}")
+        await bot.send_message(chat_id=chat_id, text=f"❌ Error al procesar con IA. Usa el menú manual.\nDetalle: {e}")
 
 async def procesar_texto_libre_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MI_TELEGRAM_ID: return
@@ -126,50 +127,52 @@ async def procesar_texto_libre_ia(update: Update, context: ContextTypes.DEFAULT_
         return
 
     m = await update.message.reply_text("🧠 *Pensando...*", parse_mode='Markdown')
-    respuesta = modelo_ia.generate_content([texto])
+    respuesta = cliente_ia.models.generate_content(model='gemini-1.5-flash', contents=texto, config=config_ia)
     await procesar_json_ia(context.bot, MI_TELEGRAM_ID, respuesta.text)
     await m.delete()
 
 async def procesar_audio_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MI_TELEGRAM_ID: return
-    m = await update.message.reply_text("🎙️ *Escuchando y transcribiendo con IA...*", parse_mode='Markdown')
+    m = await update.message.reply_text("🎙️ *Transcribiendo con IA...*", parse_mode='Markdown')
     
-    # Descargar audio
     archivo = await context.bot.get_file(update.message.voice.file_id)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as temp_audio:
         await archivo.download_to_drive(temp_audio.name)
         
-        # Subir a Gemini y procesar
-        archivo_gemini = genai.upload_file(temp_audio.name, mime_type="audio/ogg")
-        respuesta = modelo_ia.generate_content([archivo_gemini, "Analiza este audio y extrae los datos."])
-        
+        archivo_gemini = cliente_ia.files.upload(file=temp_audio.name, config={'mime_type': 'audio/ogg'})
+        respuesta = cliente_ia.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=[archivo_gemini, "Analiza este audio y extrae los datos."],
+            config=config_ia
+        )
         await procesar_json_ia(context.bot, MI_TELEGRAM_ID, respuesta.text)
         
-        # Limpiar
-        genai.delete_file(archivo_gemini.name)
+        cliente_ia.files.delete(name=archivo_gemini.name)
         os.remove(temp_audio.name)
     await m.delete()
 
 async def procesar_foto_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MI_TELEGRAM_ID: return
-    m = await update.message.reply_text("📸 *Analizando ticket/recibo con Visión Artificial...*", parse_mode='Markdown')
+    m = await update.message.reply_text("📸 *Analizando ticket con IA...*", parse_mode='Markdown')
     
-    # Descargar foto
     archivo = await context.bot.get_file(update.message.photo[-1].file_id)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_foto:
         await archivo.download_to_drive(temp_foto.name)
         
-        archivo_gemini = genai.upload_file(temp_foto.name, mime_type="image/jpeg")
-        respuesta = modelo_ia.generate_content([archivo_gemini, "Lee este ticket o foto y extrae los datos del gasto."])
-        
+        archivo_gemini = cliente_ia.files.upload(file=temp_foto.name, config={'mime_type': 'image/jpeg'})
+        respuesta = cliente_ia.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=[archivo_gemini, "Lee este ticket o foto y extrae los datos del gasto."],
+            config=config_ia
+        )
         await procesar_json_ia(context.bot, MI_TELEGRAM_ID, respuesta.text)
         
-        genai.delete_file(archivo_gemini.name)
+        cliente_ia.files.delete(name=archivo_gemini.name)
         os.remove(temp_foto.name)
     await m.delete()
 
 # ==========================================
-# 4. FLUJOS MANUALES ORIGINALES
+# 4. FLUJOS MANUALES
 # ==========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_user.id != MI_TELEGRAM_ID: return ConversationHandler.END
@@ -235,7 +238,6 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     elif query.data.startswith('start_enfoque_'):
         minutos = int(query.data.split('_')[2])
         await query.edit_message_text(f"⏱️ *Enfoque activo: {minutos} minutos.*\n¡Silencia distracciones!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏹️ Finalizar por Urgencia", callback_data='cancelar_enfoque')]]), parse_mode='Markdown')
-        # Lógica asíncrona de temporizador
         async def temp():
             await asyncio.sleep(minutos * 60)
             await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"🔔 *¡TIEMPO CUMPLIDO ({minutos} min)!* Tómate un descanso.", parse_mode='Markdown')
@@ -246,30 +248,25 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     elif query.data == 'volver_inicio':
         await query.edit_message_text("Menú Principal:", reply_markup=obtener_menu_principal())
 
-# (Se asume que mantienes tus funciones capturar_descripcion, capturar_f_monto, etc. aquí para el menú manual, por limpieza visual puedes pegarlas de la versión anterior)
-
 # ==========================================
-# ARRANQUE Y ENSAMBLAJE
+# ARRANQUE DEL BOT
 # ==========================================
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # 1. Configurar el Reloj Interno (Scheduler)
-    scheduler = AsyncIOScheduler()
-    scheduler.configure(timezone='America/Monterrey')
-    scheduler.add_job(alerta_matutina, 'cron', hour=6, minute=0, args=[app.bot])
-    scheduler.add_job(alerta_nocturna, 'cron', hour=19, minute=0, args=[app.bot])
-    scheduler.start()
+    # 1. Configurar el Reloj Interno usando JobQueue de Telegram (Eliminamos APScheduler)
+    zona_horaria = ZoneInfo('America/Monterrey')
+    app.job_queue.run_daily(alerta_matutina, time=datetime.time(hour=6, minute=0, tzinfo=zona_horaria))
+    app.job_queue.run_daily(alerta_nocturna, time=datetime.time(hour=19, minute=0, tzinfo=zona_horaria))
 
     # 2. Manejadores de IA
     app.add_handler(MessageHandler(filters.VOICE, procesar_audio_ia))
     app.add_handler(MessageHandler(filters.PHOTO, procesar_foto_ia))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_texto_libre_ia)) 
 
-    # 3. Manejadores de Botones Manuales
+    # 3. Manejadores Manuales
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(manejador_botones)) 
-    # Asegúrate de volver a pegar aquí los dos ConversationHandlers (conv_handler_tarea y conv_handler_finanzas) si quieres seguir teniendo la opción de registro por clic.
 
-    print("🤖 Súper Bot iniciado: DB Local + Inteligencia Gemini + Alertas Automatizadas.")
+    print("🤖 Súper Bot iniciado: DB Local + IA Actualizada + Alertas JobQueue.")
     app.run_polling()
