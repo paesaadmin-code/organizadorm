@@ -50,7 +50,7 @@ Formato Finanza: {{"tipo_registro": "finanza", "tipo": "Gasto" o "Ingreso", "are
 config_ia = types.GenerateContentConfig(system_instruction=instruccion_sistema)
 
 # Creamos una sesión de chat global para que la IA recuerde la conversación
-chat_ia = cliente_ia.chats.create(model='gemini-1.5-flash', config=config_ia)
+chat_ia = cliente_ia.chats.create(model='gemini-2.0-flash', config=config_ia)
 
 # ==========================================
 # 1. BASE DE DATOS (POSTGRESQL NEON)
