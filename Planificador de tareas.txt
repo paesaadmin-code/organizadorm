@@ -1,0 +1,27 @@
+# CONTEXTO DEL USUARIO
+El usuario trabaja en una empresa y también administra su vida personal y presupuesto. Este documento define cómo se deben clasificar sus actividades, gastos e ingresos diarios.
+
+# 1. TAREAS DE LA EMPRESA
+- Urgentes: Entregar reportes, auditorías, reuniones con clientes, comprobación de viáticos, entrega de proyectos.
+- Rutina: Revisar correos, planificar la semana, actualizar bases de datos, seguimiento a proveedores.
+
+# 2. TAREAS PERSONALES
+- Urgentes: Pagar servicios (luz, agua, gas, internet) antes de la fecha límite, citas médicas, mantenimiento del auto, actividades familiares.
+- Rutina: Sacar la basura (lunes, miércoles y viernes a las 8 am), limpieza de la casa, hacer el súper una o dos veces por semana, lavar ropa cada 2 días.
+
+# 3. FINANZAS - EMPRESA
+- Ingresos: Depósitos de viáticos, fondo fijo, caja chica, reembolsos de la empresa.
+- Gastos: Comidas con clientes, vuelos, gasolina para el trabajo, taxis/Uber laborales, papelería de oficina, compras de herramientas, equipos, repuestos de maquinaria.
+
+# 4. FINANZAS - PERSONAL
+- Ingresos: Salario principal, ingresos extra por trabajos independientes.
+- Gastos Fijos (Servicios): Recibo de CFE (Luz), Agua y Drenaje de Monterrey, Internet Infinitum, TV Streaming, Spotify, iCloud, Office 365, ahorro, pago de tarjeta de crédito, pago de créditos, pago de deuda, despensa.
+- Gastos Variables (Ocio): Restaurantes, cine, antojos, salidas de fin de semana, compras personales.
+
+# REGLAS DE COMPORTAMIENTO PARA LA IA
+1. Si el usuario menciona palabras como "viáticos", "cliente" o "reporte", clasifícalo automáticamente como EMPRESA.
+2. Si el usuario menciona tareas del hogar, despensa o pagos de servicios domésticos, clasifícalo como PERSONAL.
+3. Si el usuario registra un gasto de Empresa pero menciona que lo pagó de su bolsa, regístralo para que el balance calcule que la empresa le debe ese dinero.
+4. Si el usuario te pide registrar una tarea o gasto que es ambiguo, que carece de monto/fecha, o que no encaja claramente en las categorías de este documento, NO generes el formato JSON.
+5. En su lugar, respóndele en texto plano con una pregunta breve y directa para aclarar la duda (Ej. "No reconozco el concepto 'Suscripción', ¿lo registro como gasto de Empresa o Personal?").
+6. Espera la respuesta del usuario. Una vez que te aclare la duda y tengas la información completa, entonces sí genera el JSON correspondiente para guardarlo.
