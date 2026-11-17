@@ -49,7 +49,7 @@ class ServidorFantasma(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"ok" if self.path == "/health" else b"Bot Ejecutivo V16 (Presupuestos, Saldos y Consultas) Activo!")
+        self.wfile.write(b"ok" if self.path == "/health" else b"Bot Ejecutivo V17 (Doble Saldo Fix, Resumen y Tiempos) Activo!")
 
 def iniciar_servidor():
     puerto = int(os.environ.get("PORT", 10000))
@@ -66,6 +66,9 @@ CACHE_CATEGORIAS = {}
 def init_db_pool():
     global db_pool
     if DATABASE_URL: db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
+
+def get_db_connection():
+    return db_pool.getconn()
 
 def ejecutar_sql(query, params=None, fetch_all=False, fetch_one=False):
     if not db_pool: return None
@@ -97,15 +100,12 @@ def init_db():
         "presupuestos (categoria TEXT PRIMARY KEY, limite REAL)"
     ]
     for tabla in tablas: ejecutar_sql(f"CREATE TABLE IF NOT EXISTS {tabla}")
-    
     ejecutar_sql("CREATE INDEX IF NOT EXISTS idx_tareas_fecha ON tareas(fecha_calculada)")
     ejecutar_sql("CREATE INDEX IF NOT EXISTS idx_finanzas_fecha ON finanzas(fecha)")
     
-    # Migraciones en caliente
     ejecutar_sql("ALTER TABLE config_cuentas ADD COLUMN IF NOT EXISTS saldo REAL DEFAULT 0")
     ejecutar_sql("ALTER TABLE config_categorias ADD COLUMN IF NOT EXISTS palabras_clave TEXT DEFAULT ''")
     
-    # Sembrar configuraciones si están vacías
     if not ejecutar_sql("SELECT 1 FROM config_cuentas LIMIT 1", fetch_one=True):
         for c in ['Nu', 'BBVA', 'Banorte', 'Efectivo']: ejecutar_sql("INSERT INTO config_cuentas (nombre, saldo) VALUES (%s, 0)", (c,))
     if not ejecutar_sql("SELECT 1 FROM config_categorias LIMIT 1", fetch_one=True):
@@ -116,7 +116,6 @@ def init_db():
                 ('Entretenimiento', 'Gasto', 'cine,netflix,spotify,salida,juego'),
                 ('Nómina', 'Ingreso', 'sueldo,salario,quincena,pago')]
         for c, t, p in cats: ejecutar_sql("INSERT INTO config_categorias (nombre, tipo, palabras_clave) VALUES (%s, %s, %s)", (c, t, p))
-    
     recargar_cache()
 
 def recargar_cache():
@@ -140,7 +139,7 @@ def registrar_auditoria(accion, detalle):
     ejecutar_sql("INSERT INTO historial (fecha, accion, detalle) VALUES (%s, %s, %s)", (fecha_ahora, accion, detalle))
 
 # ==========================================
-# 4. EXPORTACIÓN PROFESIONAL A EXCEL (CON CORRECCIÓN DE ENCABEZADOS)
+# 4. EXPORTACIÓN PROFESIONAL
 # ==========================================
 async def generar_y_enviar_backup(context: ContextTypes.DEFAULT_TYPE):
     conn = get_db_connection()
@@ -153,7 +152,7 @@ async def generar_y_enviar_backup(context: ContextTypes.DEFAULT_TYPE):
         path_temp = f"/tmp/backup_{tabla}.csv"
         with open(path_temp, mode='w', encoding='utf-8-sig', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(columnas) # ¡Corregido!
+            writer.writerow(columnas)
             writer.writerows(datos)
         archivos.append(path_temp)
     c.close()
@@ -189,7 +188,37 @@ async def set_presupuesto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ejecutar_sql("INSERT INTO presupuestos (categoria, limite) VALUES (%s, %s) ON CONFLICT (categoria) DO UPDATE SET limite = EXCLUDED.limite", (categoria.capitalize(), limite))
         await update.message.reply_text(f"✅ Presupuesto de ${limite} establecido para '{categoria}'.")
     except:
-        await update.message.reply_text("⚠️ Uso incorrecto. Escribe: `/presupuesto Comida 5000`", parse_mode='Markdown')
+        await update.message.reply_text("⚠️ Uso: `/presupuesto Comida 5000`", parse_mode='Markdown')
+
+async def comando_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS: return
+    hoy = datetime.date.today().strftime('%Y-%m-%d')
+    mes_actual = datetime.datetime.now().strftime('%Y-%m')
+    
+    tareas = ejecutar_sql("SELECT descripcion, prioridad FROM tareas WHERE fecha_calculada <= %s AND estado = 'Pendiente'", (hoy,), fetch_all=True) or []
+    pagos = ejecutar_sql("SELECT concepto, monto, fecha FROM finanzas WHERE fecha <= %s AND estado = 'Pendiente'", (hoy,), fetch_all=True) or []
+    fins = ejecutar_sql("SELECT tipo, monto FROM finanzas WHERE fecha LIKE %s AND estado = 'Completado'", (f"{mes_actual}-%",), fetch_all=True) or []
+    cuentas = ejecutar_sql("SELECT saldo FROM config_cuentas WHERE saldo != 0", fetch_all=True) or []
+    habito_top = ejecutar_sql("SELECT nombre, racha FROM habitos ORDER BY racha DESC LIMIT 1", fetch_one=True)
+    
+    ing = sum(f[1] for f in fins if f[0] == 'Ingreso')
+    gas = sum(f[1] for f in fins if f[0] == 'Gasto')
+    saldo_total = sum(c[0] for c in cuentas)
+    urgentes = sum(1 for t in tareas if t[1] == 'Urgente')
+
+    mensaje = f"📊 *DASHBOARD EJECUTIVO ({hoy})*\n\n"
+    mensaje += f"💰 *Saldo total:* ${saldo_total:,.2f}\n"
+    mensaje += f"📈 *Ingresos mes:* ${ing:,.2f}\n"
+    mensaje += f"📉 *Gastos mes:* ${gas:,.2f}\n"
+    mensaje += f"⚖️ *Balance mensual:* ${(ing - gas):,.2f}\n\n"
+    mensaje += f"📝 *Pendientes hoy:* {len(tareas)}\n"
+    mensaje += f"⚠️ *Urgentes:* {urgentes}\n"
+    if habito_top: mensaje += f"🔥 *Hábito top:* {habito_top[0]} ({habito_top[1]} días)\n"
+    
+    if pagos:
+        mensaje += "\n🚨 *Próximos pagos/vencidos:*\n" + "".join([f"   {'🔴' if p[2] < hoy else '🔔'} {p[0]} - ${p[1]:,.2f}\n" for p in pagos[:3]])
+            
+    await update.message.reply_text(mensaje, parse_mode='Markdown', reply_markup=obtener_menu_principal())
 
 # ==========================================
 # 6. NLP, CONSULTAS INTELIGENTES Y CONTROL DE SALDOS
@@ -203,20 +232,16 @@ STOPWORDS = PALABRAS_GASTO + PALABRAS_INGRESO + ['cuanto', 'cuánto', 'que', 'qu
 def procesar_impacto_financiero(monto, tipo, cuenta_nombre, subcat, estado):
     """Actualiza saldos reales y verifica presupuestos."""
     if estado != 'Completado': return ""
-    
-    # 1. Actualizar Saldo Real
     operador = "+" if tipo == "Ingreso" else "-"
     ejecutar_sql(f"UPDATE config_cuentas SET saldo = saldo {operador} %s WHERE LOWER(nombre) = %s", (monto, cuenta_nombre.lower()))
     
-    # 2. Verificar Presupuesto
     if tipo == "Gasto":
         limite = ejecutar_sql("SELECT limite FROM presupuestos WHERE LOWER(categoria) = %s", (subcat.lower(),), fetch_one=True)
         if limite:
             mes_actual = datetime.datetime.now().strftime('%Y-%m')
             gastado = ejecutar_sql("SELECT SUM(monto) FROM finanzas WHERE subcategoria = %s AND fecha LIKE %s AND estado = 'Completado'", (subcat, f"{mes_actual}-%"), fetch_one=True)[0] or 0
             if gastado >= limite[0] * 0.85:
-                porcentaje = (gastado / limite[0]) * 100
-                return f"\n⚠️ *¡Presupuesto al {porcentaje:.0f}%!* Has gastado ${gastado:,.0f} de ${limite[0]:,.0f} en {subcat}."
+                return f"\n⚠️ *¡Presupuesto al {(gastado / limite[0]) * 100:.0f}%!* Has gastado ${gastado:,.0f} de ${limite[0]:,.0f} en {subcat}."
     return ""
 
 def extraer_fecha(texto):
@@ -224,34 +249,38 @@ def extraer_fecha(texto):
     return fechas[0][1].strftime('%Y-%m-%d') if fechas else None
 
 def responder_consulta_inteligente(texto_min):
-    """Motor analítico avanzado sobre PostgreSQL."""
     respuesta = "🤖 *Respuesta Analítica:*\n\n"
+    año_actual = datetime.datetime.now().strftime('%Y')
     mes_actual = datetime.datetime.now().strftime('%Y-%m')
+    
+    filtro_fecha = ""
+    filtro_str = "históricamente"
+    if "este año" in texto_min: 
+        filtro_fecha = f"AND fecha LIKE '{año_actual}-%'"
+        filtro_str = "este año"
+    elif "este mes" in texto_min: 
+        filtro_fecha = f"AND fecha LIKE '{mes_actual}-%'"
+        filtro_str = "este mes"
     
     if "dinero tengo" in texto_min or "saldo" in texto_min or "cuentas" in texto_min:
         res = ejecutar_sql("SELECT nombre, saldo FROM config_cuentas ORDER BY saldo DESC", fetch_all=True)
         total = sum(r[1] for r in res)
         respuesta += f"💰 *Saldos Actuales (Total: ${total:,.2f}):*\n" + "".join([f"▫️ {r[0]}: ${r[1]:,.2f}\n" for r in res])
         
-    elif "gastando más" in texto_min or "categoría ha crecido" in texto_min:
-        res = ejecutar_sql("SELECT subcategoria, SUM(monto) as total FROM finanzas WHERE tipo='Gasto' AND fecha LIKE %s AND estado='Completado' GROUP BY subcategoria ORDER BY total DESC LIMIT 1", (f"{mes_actual}-%",), fetch_one=True)
-        if res: respuesta += f"Este mes donde más has gastado es en **{res[0]}** con un total de **${res[1]:,.2f}**."
-        else: respuesta += "No has registrado gastos este mes."
+    elif "gastando más" in texto_min or "mayor gasto" in texto_min:
+        res = ejecutar_sql(f"SELECT subcategoria, SUM(monto) as total FROM finanzas WHERE tipo='Gasto' AND estado='Completado' {filtro_fecha} GROUP BY subcategoria ORDER BY total DESC LIMIT 1", fetch_one=True)
+        if res: respuesta += f"Donde más has gastado {filtro_str} es en **{res[0]}** con un total de **${res[1]:,.2f}**."
+        else: respuesta += f"No has registrado gastos {filtro_str}."
         
     elif "descuidado" in texto_min or "peor hábito" in texto_min:
         res = ejecutar_sql("SELECT nombre, racha, ultima_fecha FROM habitos ORDER BY racha ASC, ultima_fecha ASC LIMIT 1", fetch_one=True)
-        if res: respuesta += f"Tu hábito más descuidado es **{res[0]}**. Tienes una racha de {res[1]} días (Última vez: {res[2] or 'Nunca'})."
+        if res: respuesta += f"Tu hábito más descuidado es **{res[0]}**. Racha actual: {res[1]} días."
         
-    elif "tiempo pendiente" in texto_min or "más antigua" in texto_min:
+    elif "tiempo pendiente" in texto_min:
         res = ejecutar_sql("SELECT descripcion, fecha_calculada FROM tareas WHERE estado='Pendiente' AND fecha_calculada != 'Recurrente' ORDER BY fecha_calculada ASC LIMIT 1", fetch_one=True)
         if res: respuesta += f"Tu tarea pendiente más antigua es **'{res[0]}'**, programada para el {res[1]}."
 
-    elif "urgente" in texto_min:
-        res = ejecutar_sql("SELECT descripcion, fecha_calculada FROM tareas WHERE prioridad = 'Urgente' AND estado = 'Pendiente' ORDER BY fecha_calculada ASC", fetch_all=True)
-        if not res: respuesta += "No tienes tareas urgentes pendientes."
-        else: respuesta += "⚠️ *Tareas Urgentes:*\n" + "".join([f"▫️ {r[0]} ({r[1]})\n" for r in res])
-            
-    elif "vence" in texto_min or "pendientes" in texto_min or "pagos" in texto_min:
+    elif "vence" in texto_min or "pendientes" in texto_min:
         res = ejecutar_sql("SELECT concepto, monto, fecha FROM finanzas WHERE estado = 'Pendiente' ORDER BY fecha ASC", fetch_all=True)
         if not res: respuesta += "No tienes pagos pendientes programados."
         else: respuesta += "⏳ *Próximos Vencimientos:*\n" + "".join([f"▫️ {r[0]}: ${r[1]:,.2f} ({r[2]})\n" for r in res])
@@ -261,15 +290,15 @@ def responder_consulta_inteligente(texto_min):
         prom = res[0] if res and res[0] else 0
         respuesta += f"Tu gasto promedio mensual histórico es de **${prom:,.2f}**."
 
-    elif "tareas" in texto_min and "complet" in texto_min and "mes" in texto_min:
-        res = ejecutar_sql("SELECT COUNT(*) FROM tareas WHERE estado = 'Completada' AND fecha_completado LIKE %s", (f"{mes_actual}-%",), fetch_one=True)
-        respuesta += f"Has completado **{res[0]} tareas** en lo que va del mes."
+    elif "tareas" in texto_min and "complet" in texto_min:
+        res = ejecutar_sql(f"SELECT COUNT(*) FROM tareas WHERE estado = 'Completada' {filtro_fecha.replace('fecha', 'fecha_completado')}", fetch_one=True)
+        respuesta += f"Has completado **{res[0]} tareas** {filtro_str}."
         
     elif "gasté en" in texto_min or "gaste en" in texto_min:
-        palabra_buscada = texto_min.split("en ")[-1].strip().replace("?", "")
-        res = ejecutar_sql("SELECT SUM(monto) FROM finanzas WHERE tipo = 'Gasto' AND estado = 'Completado' AND (LOWER(concepto) LIKE %s OR LOWER(subcategoria) LIKE %s)", (f"%{palabra_buscada}%", f"%{palabra_buscada}%"), fetch_one=True)
+        palabra_buscada = re.sub(r'(este año|este mes)', '', texto_min.split("en ")[-1]).strip().replace("?", "")
+        res = ejecutar_sql(f"SELECT SUM(monto) FROM finanzas WHERE tipo = 'Gasto' AND estado = 'Completado' {filtro_fecha} AND (LOWER(concepto) LIKE %s OR LOWER(subcategoria) LIKE %s)", (f"%{palabra_buscada}%", f"%{palabra_buscada}%"), fetch_one=True)
         total = res[0] or 0
-        respuesta += f"Has gastado un total de **${total:,.2f}** relacionado con '{palabra_buscada.capitalize()}'."
+        respuesta += f"Has gastado un total de **${total:,.2f}** en '{palabra_buscada.capitalize()}' {filtro_str}."
         
     else: return False
     return respuesta
@@ -295,7 +324,7 @@ def analizar_texto_local(texto):
         monto = float(match_monto.group(1).replace(',', ''))
         fecha_calc = extraer_fecha(texto) or hoy_str
         
-        cuenta_detectada = 'Efectivo' # Default
+        cuenta_detectada = 'Efectivo'
         for c in CACHE_CUENTAS:
             if c in texto_min: cuenta_detectada = c.capitalize(); break
             
@@ -398,7 +427,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await comando_exportar(update, context)
 
     elif query.data == 'listar_pagos_pendientes':
-        pagos = ejecutar_sql("SELECT id, concepto, monto, fecha, subcategoria, cuenta, tipo FROM finanzas WHERE estado = 'Pendiente' ORDER BY fecha ASC LIMIT 8", fetch_all=True) or []
+        pagos = ejecutar_sql("SELECT id, concepto, monto, fecha FROM finanzas WHERE estado = 'Pendiente' ORDER BY fecha ASC LIMIT 8", fetch_all=True) or []
         if not pagos:
             await query.edit_message_text("🎉 Sin cobros ni pagos pendientes.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='menu_finanzas')]]))
             return
@@ -409,14 +438,15 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif query.data.startswith('pagar_f_'):
         id_pago = query.data.split('_')[2]
-        info = ejecutar_sql("SELECT monto, tipo, cuenta, subcategoria FROM finanzas WHERE id = %s", (id_pago,), fetch_one=True)
-        ejecutar_sql("UPDATE finanzas SET estado = 'Completado', fecha = %s WHERE id = %s", (datetime.date.today().strftime('%Y-%m-%d'), id_pago))
-        
-        alerta_presupuesto = ""
-        if info: alerta_presupuesto = procesar_impacto_financiero(info[0], info[1], info[2], info[3], 'Completado')
-        
-        registrar_auditoria("PAGO_REALIZADO", f"ID {id_pago}")
-        await query.edit_message_text(f"💸 Pago marcado como realizado.{alerta_presupuesto}", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú", callback_data='volver_inicio')]]))
+        # PROTECCIÓN DOBLE SALDO: Solo procesar si realmente estaba pendiente
+        info = ejecutar_sql("SELECT monto, tipo, cuenta, subcategoria, estado FROM finanzas WHERE id = %s", (id_pago,), fetch_one=True)
+        if info and info[4] == 'Pendiente':
+            ejecutar_sql("UPDATE finanzas SET estado = 'Completado', fecha = %s WHERE id = %s", (datetime.date.today().strftime('%Y-%m-%d'), id_pago))
+            alerta_presupuesto = procesar_impacto_financiero(info[0], info[1], info[2], info[3], 'Completado')
+            registrar_auditoria("PAGO_REALIZADO", f"ID {id_pago}")
+            await query.edit_message_text(f"💸 Pago marcado como realizado.{alerta_presupuesto}", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú", callback_data='volver_inicio')]]))
+        else:
+            await query.edit_message_text("Este pago ya fue procesado o no existe.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú", callback_data='volver_inicio')]]))
 
     # AGENDA
     elif query.data == 'ver_calendario':
@@ -463,7 +493,6 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mensaje = titulo + f"🏢 *EMPRESA:*\n   ├ 📈 In: ${ing_emp:,.2f} | 📉 Out: ${gas_emp:,.2f}\n   └ ⚖️ Balance: ${(ing_emp - gas_emp):,.2f}\n\n"
         mensaje += f"👤 *PERSONAL:*\n   ├ 📈 In: ${ing_per:,.2f} | 📉 Out: ${gas_per:,.2f}\n   └ ⚖️ Balance: ${(ing_per - gas_per):,.2f}\n\n"
         
-        # AGREGADO: Cuentas Reales
         cuentas_res = ejecutar_sql("SELECT nombre, saldo FROM config_cuentas WHERE saldo != 0", fetch_all=True) or []
         if cuentas_res:
             mensaje += "💰 *Saldos Actuales:*\n" + "".join([f"   ▫️ {c[0]}: ${c[1]:,.2f}\n" for c in cuentas_res]) + "\n"
@@ -499,7 +528,6 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         id_borrar = query.data.split('_')[2]
         info = ejecutar_sql("SELECT concepto, monto, tipo, cuenta, estado FROM finanzas WHERE id = %s", (id_borrar,), fetch_one=True)
         if info: 
-            # Revertir saldo
             if info[4] == 'Completado':
                 operador = "-" if info[2] == "Ingreso" else "+"
                 ejecutar_sql(f"UPDATE config_cuentas SET saldo = saldo {operador} %s WHERE nombre = %s", (info[1], info[3]))
@@ -542,9 +570,7 @@ async def guardar_datos_nlp(bot, chat_id, datos):
         ejecutar_sql("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha, categoria, estado, subcategoria, cuenta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                   (datos['tipo'], datos['area'], datos['concepto'], datos['monto'], cuenta, datos['fecha'], 'General', estado_f, subcat, cuenta))
         
-        # Procesar Saldo y Presupuesto
         alerta_presupuesto = procesar_impacto_financiero(datos['monto'], datos['tipo'], cuenta, subcat, estado_f)
-        
         emoji_estado = "⏳ Pendiente" if estado_f == 'Pendiente' else "✅ Completado"
         msg = MSG_EXITO_FINANZA.format(concepto=datos['concepto'].title(), monto=datos['monto'], cat=subcat, cuenta=cuenta, fecha=datos['fecha'], estado=emoji_estado, alerta=alerta_presupuesto)
         
@@ -593,7 +619,6 @@ async def procesar_foto_local(update: Update, context: ContextTypes.DEFAULT_TYPE
         archivo = await context.bot.get_file(update.message.photo[-1].file_id)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_foto:
             await archivo.download_to_drive(temp_foto.name)
-            # OPTIMIZACIÓN OCR: Ahorra RAM
             img = Image.open(temp_foto.name).convert('L')
             img.thumbnail((1200, 1200)) 
             texto_crudo = pytesseract.image_to_string(img, lang='spa')
@@ -602,7 +627,6 @@ async def procesar_foto_local(update: Update, context: ContextTypes.DEFAULT_TYPE
             match = re.search(r'(?:total|importe)[\s\$:]*([\d,]+\.\d{2})', texto_crudo, re.IGNORECASE)
             if match: monto = match.group(1)
             
-            # Limite expandido a 300 para no cortar información valiosa
             await manejar_resultado_analisis(update, context, analizar_texto_local(f"ticket pagué {monto} {texto_crudo[:300]}"))
             os.remove(temp_foto.name)
     except Exception: await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=MSG_ERROR)
@@ -673,15 +697,15 @@ async def capturar_f_area(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     return F_CONCEPTO
 async def capturar_f_concepto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     c.user_data['nueva_finanza']['concepto'] = u.message.text
-    await u.message.reply_text("💵 *Monto numérico:*", parse_mode='Markdown')
+    await u.message.reply_text("💵 *Monto:*", parse_mode='Markdown')
     return F_MONTO
 async def capturar_f_monto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     try: c.user_data['nueva_finanza']['monto'] = float(u.message.text)
     except ValueError:
-        await u.message.reply_text("⚠️ Solo ingresa números:")
+        await u.message.reply_text("⚠️ Solo números:")
         return F_MONTO 
     if c.user_data['nueva_finanza']['tipo'] == "Gasto":
-        await u.message.reply_text("💳 *Método de pago:*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Tarjeta", callback_data='f_tarjeta'), InlineKeyboardButton("Efectivo", callback_data='f_efectivo')]]), parse_mode='Markdown')
+        await u.message.reply_text("💳 *Método:*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Tarjeta", callback_data='f_tarjeta'), InlineKeyboardButton("Efectivo", callback_data='f_efectivo')]]), parse_mode='Markdown')
         return F_METODO
     c.user_data['nueva_finanza']['metodo'] = "N/A"
     await u.message.reply_text("📅 *Fecha:*", parse_mode='Markdown')
@@ -698,7 +722,6 @@ async def capturar_f_fecha(u: Update, cx: ContextTypes.DEFAULT_TYPE) -> int:
     est = 'Pendiente' if ff > datetime.datetime.now().strftime('%Y-%m-%d') else 'Completado'
     
     ejecutar_sql("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha, categoria, estado, subcategoria, cuenta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", (f['tipo'], f['area'], f['concepto'], f['monto'], f['metodo'], ff, 'General', est, 'General', f['metodo']))
-    
     alerta_presupuesto = procesar_impacto_financiero(f['monto'], f['tipo'], f['metodo'], 'General', est)
     
     msg = MSG_EXITO_FINANZA.format(concepto=f['concepto'].title(), monto=f['monto'], cat="General", cuenta=f['metodo'], fecha=ff, estado="⏳ Pendiente" if est == 'Pendiente' else "✅ Completado", alerta=alerta_presupuesto)
@@ -721,9 +744,10 @@ if __name__ == '__main__':
     threading.Thread(target=iniciar_servidor, daemon=True).start()
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Handlers Configuración Dinámica
+    # Handlers Configuración
     app.add_handler(CommandHandler("add_cuenta", add_cuenta))
     app.add_handler(CommandHandler("presupuesto", set_presupuesto))
+    app.add_handler(CommandHandler("resumen", comando_resumen))
 
     conv_handler_tarea = ConversationHandler(
         entry_points=[CallbackQueryHandler(iniciar_registro_tarea, pattern='^tarea_nueva$')],
@@ -752,5 +776,5 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.PHOTO, procesar_foto_local))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_texto_libre)) 
 
-    print("🤖 Súper Bot V16 INICIADO: Módulo Ejecutivo (Presupuestos, Cuentas y Consultas).")
+    print("🤖 Súper Bot V17 INICIADO: Resumen Ejecutivo, Consultas Temporales y Bloqueo de Saldos.")
     app.run_polling()
