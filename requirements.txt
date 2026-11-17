@@ -1,5 +1,8 @@
 python-telegram-bot
 python-telegram-bot[job-queue]
 dateparser
-google-genai
 psycopg2-binary
+SpeechRecognition
+pydub
+pytesseract
+Pillow
