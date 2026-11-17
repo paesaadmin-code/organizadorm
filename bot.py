@@ -49,7 +49,7 @@ class ServidorFantasma(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"ok" if self.path == "/health" else b"Bot Ejecutivo V19 (Aprendizaje Limpio y Saldos) Activo!")
+        self.wfile.write(b"ok" if self.path == "/health" else b"Bot Ejecutivo V21 (Produccion Final) Activo!")
 
 def iniciar_servidor():
     puerto = int(os.environ.get("PORT", 10000))
@@ -60,7 +60,7 @@ def iniciar_servidor():
 # ==========================================
 db_pool = None
 CACHE_DICCIONARIO = {'Empresa': {}, 'Personal': {}}
-CACHE_CUENTAS = []
+CACHE_CUENTAS = {}
 CACHE_CATEGORIAS = {}
 
 def init_db_pool():
@@ -91,18 +91,20 @@ def ejecutar_sql(query, params=None, fetch_all=False, fetch_one=False):
 def init_db():
     tablas = [
         "tareas (id SERIAL PRIMARY KEY, descripcion TEXT, tipo TEXT, prioridad TEXT, fecha_original TEXT, fecha_calculada TEXT, notas TEXT, estado TEXT DEFAULT 'Pendiente', fecha_completado TEXT)",
-        "finanzas (id SERIAL PRIMARY KEY, tipo TEXT, area TEXT, concepto TEXT, monto REAL, metodo TEXT, fecha TEXT, categoria TEXT DEFAULT 'General', subcategoria TEXT DEFAULT 'General', cuenta TEXT DEFAULT 'Efectivo', estado TEXT DEFAULT 'Completado')",
+        "finanzas (id SERIAL PRIMARY KEY, tipo TEXT, area TEXT, concepto TEXT, monto REAL, metodo TEXT, fecha TEXT, categoria TEXT DEFAULT 'General', subcategoria TEXT DEFAULT 'General', cuenta TEXT DEFAULT 'Efectivo', estado TEXT DEFAULT 'Completado', es_recordatorio BOOLEAN DEFAULT FALSE)",
         "diccionario (palabra TEXT PRIMARY KEY, categoria TEXT)",
         "historial (id SERIAL PRIMARY KEY, fecha TEXT, accion TEXT, detalle TEXT)",
         "habitos (id SERIAL PRIMARY KEY, nombre TEXT, racha INTEGER DEFAULT 0, ultima_fecha TEXT)",
         "config_cuentas (nombre TEXT PRIMARY KEY, saldo REAL DEFAULT 0)",
         "config_categorias (nombre TEXT PRIMARY KEY, tipo TEXT, palabras_clave TEXT DEFAULT '')",
-        "presupuestos (categoria TEXT PRIMARY KEY, limite REAL)"
+        "presupuestos (categoria TEXT PRIMARY KEY, limite REAL)",
+        "errores (id SERIAL PRIMARY KEY, fecha TEXT, modulo TEXT, error TEXT)"
     ]
     for tabla in tablas: ejecutar_sql(f"CREATE TABLE IF NOT EXISTS {tabla}")
     ejecutar_sql("CREATE INDEX IF NOT EXISTS idx_tareas_fecha ON tareas(fecha_calculada)")
     ejecutar_sql("CREATE INDEX IF NOT EXISTS idx_finanzas_fecha ON finanzas(fecha)")
     
+    ejecutar_sql("ALTER TABLE finanzas ADD COLUMN IF NOT EXISTS es_recordatorio BOOLEAN DEFAULT FALSE")
     ejecutar_sql("ALTER TABLE config_cuentas ADD COLUMN IF NOT EXISTS saldo REAL DEFAULT 0")
     ejecutar_sql("ALTER TABLE config_categorias ADD COLUMN IF NOT EXISTS palabras_clave TEXT DEFAULT ''")
     
@@ -125,7 +127,8 @@ def recargar_cache():
     CACHE_DICCIONARIO['Personal'] = {f[0]: 3 for f in filas_dicc if f[1] == 'Personal'}
     
     filas_cuentas = ejecutar_sql("SELECT nombre FROM config_cuentas", fetch_all=True) or []
-    CACHE_CUENTAS = [f[0].lower() for f in filas_cuentas]
+    CACHE_CUENTAS.clear()
+    for f in filas_cuentas: CACHE_CUENTAS[f[0].lower()] = f[0]
     
     filas_cats = ejecutar_sql("SELECT nombre, tipo, palabras_clave FROM config_categorias", fetch_all=True) or []
     CACHE_CATEGORIAS.clear()
@@ -138,14 +141,18 @@ def registrar_auditoria(accion, detalle):
     fecha_ahora = datetime.datetime.now(ZoneInfo('America/Monterrey')).strftime('%Y-%m-%d %H:%M:%S')
     ejecutar_sql("INSERT INTO historial (fecha, accion, detalle) VALUES (%s, %s, %s)", (fecha_ahora, accion, detalle))
 
+def registrar_error(modulo, error_msg):
+    fecha_ahora = datetime.datetime.now(ZoneInfo('America/Monterrey')).strftime('%Y-%m-%d %H:%M:%S')
+    ejecutar_sql("INSERT INTO errores (fecha, modulo, error) VALUES (%s, %s, %s)", (fecha_ahora, modulo, error_msg))
+
 # ==========================================
-# 4. EXPORTACIÓN Y RECALCULO DE SALDOS
+# 4. EXPORTACIÓN PROFESIONAL Y RECALCULO DE SALDOS
 # ==========================================
 async def generar_y_enviar_backup(context: ContextTypes.DEFAULT_TYPE):
     conn = get_db_connection()
     c = conn.cursor()
     archivos = []
-    for tabla in ['finanzas', 'tareas', 'habitos', 'presupuestos']:
+    for tabla in ['finanzas', 'tareas', 'habitos', 'presupuestos', 'errores']:
         c.execute(f"SELECT * FROM {tabla}")
         columnas = [desc[0] for desc in c.description]
         datos = c.fetchall()
@@ -172,7 +179,8 @@ async def comando_exportar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def recalcular_saldos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS: return
     ejecutar_sql("UPDATE config_cuentas SET saldo = 0")
-    movimientos = ejecutar_sql("SELECT tipo, monto, cuenta FROM finanzas WHERE estado='Completado'", fetch_all=True) or []
+    # PARCHE 2: Recalcular saldos ignorando los recordatorios
+    movimientos = ejecutar_sql("SELECT tipo, monto, cuenta FROM finanzas WHERE estado='Completado' AND es_recordatorio = FALSE", fetch_all=True) or []
     
     for tipo, monto, cuenta in movimientos:
         operador = "+" if tipo == "Ingreso" else "-"
@@ -198,7 +206,8 @@ async def set_presupuesto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         limite = float(context.args[1])
         ejecutar_sql("INSERT INTO presupuestos (categoria, limite) VALUES (%s, %s) ON CONFLICT (categoria) DO UPDATE SET limite = EXCLUDED.limite", (categoria.capitalize(), limite))
         await update.message.reply_text(f"✅ Presupuesto de ${limite} establecido para '{categoria}'.")
-    except:
+    except Exception as e:
+        registrar_error("PRESUPUESTO", str(e))
         await update.message.reply_text("⚠️ Uso: `/presupuesto Comida 5000`", parse_mode='Markdown')
 
 async def comando_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -207,8 +216,10 @@ async def comando_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mes_actual = datetime.datetime.now().strftime('%Y-%m')
     
     tareas = ejecutar_sql("SELECT descripcion, prioridad FROM tareas WHERE fecha_calculada <= %s AND estado = 'Pendiente'", (hoy,), fetch_all=True) or []
-    pagos = ejecutar_sql("SELECT concepto, monto, fecha FROM finanzas WHERE fecha <= %s AND estado = 'Pendiente'", (hoy,), fetch_all=True) or []
-    fins = ejecutar_sql("SELECT tipo, monto FROM finanzas WHERE fecha LIKE %s AND estado = 'Completado'", (f"{mes_actual}-%",), fetch_all=True) or []
+    pagos = ejecutar_sql("SELECT concepto, monto, fecha, es_recordatorio FROM finanzas WHERE fecha <= %s AND estado = 'Pendiente'", (hoy,), fetch_all=True) or []
+    
+    # PARCHE 3: Ignorar recordatorios en el dashboard mensual real
+    fins = ejecutar_sql("SELECT tipo, monto FROM finanzas WHERE fecha LIKE %s AND estado = 'Completado' AND es_recordatorio = FALSE", (f"{mes_actual}-%",), fetch_all=True) or []
     cuentas = ejecutar_sql("SELECT saldo FROM config_cuentas WHERE saldo != 0", fetch_all=True) or []
     habito_top = ejecutar_sql("SELECT nombre, racha FROM habitos ORDER BY racha DESC LIMIT 1", fetch_one=True)
     
@@ -227,7 +238,6 @@ async def comando_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 6. NLP, CONSULTAS INTELIGENTES Y CONTROL DE SALDOS
 # ==========================================
 PALABRAS_EMPRESA_BASE = {'viático': 3, 'vuelo': 2, 'gasolina': 2, 'uber': 2, 'cliente': 3, 'empresa': 3, 'proveedor': 3, 'sat': 3}
-# PARCHE 4: CLASIFICACIÓN AUTOMÁTICA ENRIQUECIDA
 PALABRAS_PERSONAL_BASE = {
     'despensa': 3, 'luz': 3, 'agua': 3, 'internet': 3, 'cfe': 3, 'renta': 3, 'casa': 2, 'médico': 2, 'personal': 3, 'ropa': 2,
     'telcel': 5, 'netflix': 5, 'spotify': 5, 'walmart': 5, 'soriana': 5, 'heb': 5, 'farmacia': 5, 'amazon': 5, 'mercadolibre': 5
@@ -236,7 +246,6 @@ PALABRAS_GASTO = ['pagué', 'pague', 'compré', 'compre', 'gasté', 'gaste', 'co
 PALABRAS_INGRESO = ['deposité', 'deposite', 'transferí', 'cobré', 'cobre', 'sueldo', 'pagaron', 'ingreso']
 STOPWORDS = PALABRAS_GASTO + PALABRAS_INGRESO + ['cuanto', 'cuánto', 'que', 'qué', 'dime', 'tengo', 'que', 'y', 'son', 'es', 'fueron', 'voy', 'va', 'hacer', 'me', 'le', 'se', 'lo', 'del', 'al', 'el', 'la', 'los', 'las', 'un', 'una', 'mañana', 'hoy', 'ayer', 'pasado', 'lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado', 'domingo', 'en', 'para', 'de', 'a', 'por', 'con', 'pesos', 'mxn', 'este', 'esta', 'ya', 'cobro', 'día', 'dia']
 
-# PARCHE 1: EXTRACCIÓN LIMPIA DE PALABRA DE APRENDIZAJE
 def obtener_palabra_aprendizaje(texto):
     if not texto: return None
     texto = texto.lower().strip()
@@ -247,7 +256,7 @@ def obtener_palabra_aprendizaje(texto):
     return palabras[0]
 
 def procesar_impacto_financiero(monto, tipo, cuenta_nombre, subcat, estado):
-    if estado != 'Completado': return ""
+    if estado != 'Completado' or monto == 0.0: return ""
     operador = "+" if tipo == "Ingreso" else "-"
     ejecutar_sql(f"UPDATE config_cuentas SET saldo = saldo {operador} %s WHERE LOWER(nombre) = %s", (monto, cuenta_nombre.lower()))
     
@@ -279,7 +288,7 @@ def responder_consulta_inteligente(texto_min):
         total = sum(r[1] for r in res)
         respuesta += f"💰 *Saldos Actuales (Total: ${total:,.2f}):*\n" + "".join([f"▫️ {r[0]}: ${r[1]:,.2f}\n" for r in res])
     elif "gastando más" in texto_min or "mayor gasto" in texto_min:
-        res = ejecutar_sql(f"SELECT subcategoria, SUM(monto) as total FROM finanzas WHERE tipo='Gasto' AND estado='Completado' {filtro_fecha} GROUP BY subcategoria ORDER BY total DESC LIMIT 1", fetch_one=True)
+        res = ejecutar_sql(f"SELECT subcategoria, SUM(monto) as total FROM finanzas WHERE tipo='Gasto' AND estado='Completado' AND es_recordatorio = FALSE {filtro_fecha} GROUP BY subcategoria ORDER BY total DESC LIMIT 1", fetch_one=True)
         if res: respuesta += f"Donde más has gastado {filtro_str} es en **{res[0]}** con un total de **${res[1]:,.2f}**."
         else: respuesta += f"No has registrado gastos {filtro_str}."
     elif "descuidado" in texto_min or "peor hábito" in texto_min:
@@ -293,7 +302,7 @@ def responder_consulta_inteligente(texto_min):
         if not res: respuesta += "No tienes pagos pendientes programados."
         else: respuesta += "⏳ *Próximos Vencimientos:*\n" + "".join([f"▫️ {r[0]}: ${r[1]:,.2f} ({r[2]})\n" for r in res])
     elif "promedio" in texto_min and "mensual" in texto_min:
-        res = ejecutar_sql("SELECT AVG(mensual) FROM (SELECT SUM(monto) as mensual FROM finanzas WHERE tipo='Gasto' AND estado='Completado' GROUP BY substr(fecha, 1, 7)) as sub", fetch_one=True)
+        res = ejecutar_sql("SELECT AVG(mensual) FROM (SELECT SUM(monto) as mensual FROM finanzas WHERE tipo='Gasto' AND estado='Completado' AND es_recordatorio = FALSE GROUP BY substr(fecha, 1, 7)) as sub", fetch_one=True)
         prom = res[0] if res and res[0] else 0
         respuesta += f"Tu gasto promedio mensual histórico es de **${prom:,.2f}**."
     elif "tareas" in texto_min and "complet" in texto_min:
@@ -301,7 +310,7 @@ def responder_consulta_inteligente(texto_min):
         respuesta += f"Has completado **{res[0]} tareas** {filtro_str}."
     elif "gasté en" in texto_min or "gaste en" in texto_min:
         palabra_buscada = re.sub(r'(este año|este mes)', '', texto_min.split("en ")[-1]).strip().replace("?", "")
-        res = ejecutar_sql(f"SELECT SUM(monto) FROM finanzas WHERE tipo = 'Gasto' AND estado = 'Completado' {filtro_fecha} AND (LOWER(concepto) LIKE %s OR LOWER(subcategoria) LIKE %s)", (f"%{palabra_buscada}%", f"%{palabra_buscada}%"), fetch_one=True)
+        res = ejecutar_sql(f"SELECT SUM(monto) FROM finanzas WHERE tipo = 'Gasto' AND estado = 'Completado' AND es_recordatorio = FALSE {filtro_fecha} AND (LOWER(concepto) LIKE %s OR LOWER(subcategoria) LIKE %s)", (f"%{palabra_buscada}%", f"%{palabra_buscada}%"), fetch_one=True)
         total = res[0] or 0
         respuesta += f"Has gastado un total de **${total:,.2f}** en '{palabra_buscada.capitalize()}' {filtro_str}."
     else: return False
@@ -326,13 +335,12 @@ def analizar_texto_local(texto):
     
     palabra_limpia = re.sub(r'\$?\s*([\d,]+(?:\.\d{1,2})?)\b(?:\s*pesos?)?', '', texto_min, flags=re.IGNORECASE).strip()
     palabra_limpia = re.sub(r'[^\w\s]', ' ', palabra_limpia)
-    for w in STOPWORDS + CACHE_CUENTAS: palabra_limpia = re.sub(rf'\b{w}\b', '', palabra_limpia, flags=re.IGNORECASE)
+    for w in STOPWORDS + list(CACHE_CUENTAS.keys()): palabra_limpia = re.sub(rf'\b{w}\b', '', palabra_limpia, flags=re.IGNORECASE)
     palabra_limpia = re.sub(r'\s+', ' ', palabra_limpia).strip().capitalize()
     if not palabra_limpia: palabra_limpia = "Registro general"
     
     area = "Desconocida" if score_emp == 0 and score_per == 0 else ("Empresa" if score_emp > score_per else "Personal")
     
-    # === BONUS V19: SI ES GASTO/INGRESO PERO NO HAY MONTO (Ej. "Pagar telcel mañana") ===
     tiene_intencion_financiera = (es_gasto or es_ingreso or '$' in texto_min or 'pesos' in texto_min)
     
     if tiene_intencion_financiera:
@@ -340,12 +348,12 @@ def analizar_texto_local(texto):
         monto = float(match_monto.group(1).replace(',', '')) if match_monto else 0.0
         fecha_calc = extraer_fecha(texto) or hoy_str
         
-        # Si no tiene monto, lo forzamos a 'Pendiente' para que sea un recordatorio
         estado_f = 'Pendiente' if (fecha_calc > hoy_str or monto == 0.0) else 'Completado'
+        es_recordatorio_fin = (monto == 0.0)
         
         cuenta_detectada = 'Efectivo'
-        for c in CACHE_CUENTAS:
-            if c in texto_min: cuenta_detectada = c.capitalize(); break
+        for c_low, c_orig in CACHE_CUENTAS.items(): 
+            if c_low in texto_min: cuenta_detectada = c_orig; break
             
         subcat = 'General'
         for c_key, c_orig in CACHE_CATEGORIAS.items():
@@ -354,7 +362,8 @@ def analizar_texto_local(texto):
         return {
             "tipo_registro": "finanza", "tipo": tipo_finanza, 
             "area": area, "concepto": palabra_limpia[:40], "monto": monto, "metodo": cuenta_detectada, 
-            "fecha": fecha_calc, "estado": estado_f, "subcategoria": subcat, "palabra_clave": palabra_limpia
+            "fecha": fecha_calc, "estado": estado_f, "subcategoria": subcat, "palabra_clave": palabra_limpia,
+            "es_recordatorio": es_recordatorio_fin
         }
     
     es_rec = bool(re.search(r'(cada|todos los|los)\s+(lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo|d[ií]as)', texto_min)) or (sum(1 for d in ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo'] if d in texto_min) >= 2)
@@ -439,12 +448,16 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await comando_exportar(update, context)
 
     elif query.data == 'listar_pagos_pendientes':
-        pagos = ejecutar_sql("SELECT id, concepto, monto, fecha FROM finanzas WHERE estado = 'Pendiente' ORDER BY fecha ASC LIMIT 8", fetch_all=True) or []
+        pagos = ejecutar_sql("SELECT id, concepto, monto, fecha, es_recordatorio FROM finanzas WHERE estado = 'Pendiente' ORDER BY fecha ASC LIMIT 8", fetch_all=True) or []
         if not pagos:
             await query.edit_message_text("🎉 Sin cobros ni pagos pendientes.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='menu_finanzas')]]))
             return
         hoy_str = datetime.date.today().strftime('%Y-%m-%d')
-        teclado = [[InlineKeyboardButton(f"{'🔴' if p[3] < hoy_str else '⏳'} Pagar: {p[1][:12]} ${p[2]:.0f}", callback_data=f'pagar_f_{p[0]}')] for p in pagos]
+        teclado = []
+        for p in pagos:
+            icono = "🔴" if p[3] < hoy_str else "⏳"
+            texto_btn = f"{icono} Listo: {p[1][:12]} (Recordatorio)" if p[4] else f"{icono} Pagar: {p[1][:12]} ${p[2]:.0f}"
+            teclado.append([InlineKeyboardButton(texto_btn, callback_data=f'pagar_f_{p[0]}')])
         teclado.append([InlineKeyboardButton("🔙 Volver", callback_data='menu_finanzas')])
         await query.edit_message_text("*(🔴 = Vencido)*", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(teclado))
         
@@ -477,15 +490,15 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
         await query.edit_message_text(mensaje if "🗓️" in mensaje else "Tu agenda está al día.", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]))
 
-    # BALANCES Y SALDOS
+    # BALANCES
     elif query.data.startswith('ver_balance_'):
         filtro = query.data.split('_')[2]
         hoy_str = datetime.date.today().strftime('%Y-%m-%d')
         if filtro == 'mes':
-            registros = ejecutar_sql("SELECT tipo, area, monto, concepto, fecha, estado, subcategoria FROM finanzas WHERE fecha LIKE %s ORDER BY fecha ASC", (f"{datetime.datetime.now().strftime('%Y-%m')}-%",), fetch_all=True) or []
+            registros = ejecutar_sql("SELECT tipo, area, monto, concepto, fecha, estado, subcategoria, es_recordatorio FROM finanzas WHERE fecha LIKE %s ORDER BY fecha ASC", (f"{datetime.datetime.now().strftime('%Y-%m')}-%",), fetch_all=True) or []
             titulo = "📊 *BALANCE DEL MES*\n\n"
         else:
-            registros = ejecutar_sql("SELECT tipo, area, monto, concepto, fecha, estado, subcategoria FROM finanzas ORDER BY fecha ASC", fetch_all=True) or []
+            registros = ejecutar_sql("SELECT tipo, area, monto, concepto, fecha, estado, subcategoria, es_recordatorio FROM finanzas ORDER BY fecha ASC", fetch_all=True) or []
             titulo = "📊 *BALANCE HISTÓRICO*\n\n"
             
         ing_emp = gas_emp = ing_per = gas_per = 0
@@ -494,7 +507,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         for r in registros:
             if r[5] == 'Pendiente': pendientes.append(r)
-            else: 
+            elif not r[7]: # Solo sumar finanzas reales
                 if r[0] == 'Ingreso' and r[1] == 'Empresa': ing_emp += r[2]
                 elif r[0] == 'Gasto' and r[1] == 'Empresa': gas_emp += r[2]
                 elif r[0] == 'Ingreso' and r[1] == 'Personal': ing_per += r[2]
@@ -511,21 +524,25 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if gastos_cat:
             mensaje += "🛒 *Top Gastos por Categoría:*\n" + "".join([f"   ▫️ {cat}: ${total:,.2f}\n" for cat, total in sorted(gastos_cat.items(), key=lambda x: x[1], reverse=True)[:5]])
         if pendientes:
-            mensaje += "\n⏳ *PAGOS PENDIENTES:*\n" + "".join([f"   {'🔴' if p[4] < hoy_str else '🔸'} {p[3].title()} - 💲{p[2]:,.2f}\n" for p in pendientes[-5:]])
+            mensaje += "\n⏳ *PAGOS PENDIENTES:*\n" + "".join([f"   {'🔴' if p[4] < hoy_str else '🔸'} {p[3].title()} - {'Recordatorio' if p[7] else f'💲{p[2]:,.2f}'}\n" for p in pendientes[-5:]])
                 
         await query.edit_message_text(mensaje, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='menu_finanzas')]]))
 
-    # APRENDIZAJE INTERACTIVO
+    # APRENDIZAJE INTERACTIVO (PARCHE 1)
     elif query.data.startswith('aprender_'):
         categoria = "Empresa" if query.data == 'aprender_empresa' else "Personal"
         datos = context.user_data.get('pendiente_clasificar')
         if datos:
-            palabra = datos.get('palabra_clave') or datos.get('concepto') or datos.get('descripcion')
-            ejecutar_sql("INSERT INTO diccionario (palabra, categoria) VALUES (%s, %s) ON CONFLICT DO NOTHING", (palabra.lower(), categoria))
-            recargar_cache()
+            texto_aprender = datos.get('palabra_clave') or datos.get('concepto') or datos.get('descripcion')
+            palabra = obtener_palabra_aprendizaje(texto_aprender)
             
-            datos['area' if datos['tipo_registro'] == 'finanza' else 'tipo'] = categoria
-            await guardar_datos_nlp(context.bot, MI_TELEGRAM_ID, datos)
+            if palabra:
+                ejecutar_sql("INSERT INTO diccionario (palabra, categoria) VALUES (%s, %s) ON CONFLICT DO NOTHING", (palabra.lower(), categoria))
+                recargar_cache()
+                datos['area' if datos['tipo_registro'] == 'finanza' else 'tipo'] = categoria
+                await guardar_datos_nlp(context.bot, MI_TELEGRAM_ID, datos)
+            else:
+                await query.edit_message_text("⚠️ No encontré una palabra útil para aprender automáticamente.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]))
             context.user_data.pop('pendiente_clasificar', None)
             
     # EDITAR / BORRAR
@@ -537,9 +554,9 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data.startswith('borrar_f_'):
         id_borrar = query.data.split('_')[2]
-        info = ejecutar_sql("SELECT concepto, monto, tipo, cuenta, estado FROM finanzas WHERE id = %s", (id_borrar,), fetch_one=True)
+        info = ejecutar_sql("SELECT concepto, monto, tipo, cuenta, estado, es_recordatorio FROM finanzas WHERE id = %s", (id_borrar,), fetch_one=True)
         if info: 
-            if info[4] == 'Completado':
+            if info[4] == 'Completado' and not info[5]:
                 operador = "-" if info[2] == "Ingreso" else "+"
                 ejecutar_sql(f"UPDATE config_cuentas SET saldo = saldo {operador} %s WHERE nombre = %s", (info[1], info[3]))
             ejecutar_sql("DELETE FROM finanzas WHERE id = %s", (id_borrar,))
@@ -578,12 +595,15 @@ async def guardar_datos_nlp(bot, chat_id, datos):
         
     elif datos['tipo_registro'] == 'finanza':
         estado_f, subcat, cuenta = datos.get('estado', 'Completado'), datos.get('subcategoria', 'General'), datos.get('metodo', 'Efectivo')
-        ejecutar_sql("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha, categoria, estado, subcategoria, cuenta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                  (datos['tipo'], datos['area'], datos['concepto'], datos['monto'], cuenta, datos['fecha'], 'General', estado_f, subcat, cuenta))
+        es_rec_fin = datos.get('es_recordatorio', False)
+        
+        ejecutar_sql("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha, categoria, estado, subcategoria, cuenta, es_recordatorio) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                  (datos['tipo'], datos['area'], datos['concepto'], datos['monto'], cuenta, datos['fecha'], 'General', estado_f, subcat, cuenta, es_rec_fin))
         
         alerta_presupuesto = procesar_impacto_financiero(datos['monto'], datos['tipo'], cuenta, subcat, estado_f)
         emoji_estado = "⏳ Pendiente" if estado_f == 'Pendiente' else "✅ Completado"
         msg = MSG_EXITO_FINANZA.format(concepto=datos['concepto'].title(), monto=datos['monto'], cat=subcat, cuenta=cuenta, fecha=datos['fecha'], estado=emoji_estado, alerta=alerta_presupuesto)
+        if es_rec_fin: msg = msg.replace("💲 $0.00", "🔔 (Recordatorio)")
         
     await bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown', reply_markup=obtener_menu_principal())
 
@@ -592,12 +612,12 @@ async def manejar_resultado_analisis(update, context, datos):
     if area == "Desconocida":
         context.user_data['pendiente_clasificar'] = datos
         
-        # PARCHE 2: APRENDIZAJE LIMPIO
+        # PARCHE 1: Mostrar en UI solo la palabra limpia
         texto_aprender = datos.get('palabra_clave') or datos.get('concepto') or datos.get('descripcion')
         palabra = obtener_palabra_aprendizaje(texto_aprender)
         
         if not palabra:
-            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="⚠️ No encontré una palabra útil para aprendizaje automático. Lo guardaré por defecto.")
+            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="⚠️ No encontré una palabra útil para clasificar. Lo guardaré en 'Personal' por defecto.")
             datos['area' if datos['tipo_registro'] == 'finanza' else 'tipo'] = 'Personal'
             await guardar_datos_nlp(context.bot, MI_TELEGRAM_ID, datos)
             return
@@ -625,17 +645,25 @@ async def procesar_audio_local(update: Update, context: ContextTypes.DEFAULT_TYP
             await archivo.download_to_drive(temp_audio.name)
             wav_path = temp_audio.name.replace(".ogg", ".wav")
             AudioSegment.from_ogg(temp_audio.name).export(wav_path, format="wav")
-            with sr.AudioFile(wav_path) as source: texto = sr.Recognizer().recognize_google(sr.Recognizer().record(source), language="es-MX")
+            with sr.AudioFile(wav_path) as source: 
+                texto = sr.Recognizer().recognize_google(sr.Recognizer().record(source), language="es-MX")
+            
+            # PARCHE 4: Validar audios basura/vacíos
+            if len(texto.strip()) < 3:
+                raise Exception("Audio vacío o ininteligible")
+                
             await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"🗣️ _\"{texto}\"_", parse_mode='Markdown')
             await manejar_resultado_analisis(update, context, analizar_texto_local(texto))
             os.remove(temp_audio.name)
             os.remove(wav_path)
-    except Exception: await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=MSG_ERROR)
+    except Exception as e:
+        registrar_error("AUDIO", str(e))
+        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=MSG_ERROR)
     finally: await m.delete()
 
 async def procesar_foto_local(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS: return
-    m = await update.message.reply_text("📸 *Escaneando OCR (Modo Seguro)...*", parse_mode='Markdown')
+    m = await update.message.reply_text("📸 *Escaneando OCR...*", parse_mode='Markdown')
     try:
         archivo = await context.bot.get_file(update.message.photo[-1].file_id)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_foto:
@@ -646,11 +674,16 @@ async def procesar_foto_local(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             monto = ""
             match = re.search(r'(?:total|importe)[\s\$:]*([\d,]+\.\d{2})', texto_crudo, re.IGNORECASE)
-            if match: monto = match.group(1)
+            if match: 
+                monto = match.group(1)
+            else:
+                raise Exception("No se detectó un monto 'TOTAL' seguro en el ticket.")
             
             await manejar_resultado_analisis(update, context, analizar_texto_local(f"ticket pagué {monto} {texto_crudo[:300]}"))
             os.remove(temp_foto.name)
-    except Exception: await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=MSG_ERROR)
+    except Exception as e: 
+        registrar_error("OCR", str(e))
+        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"⚠️ OCR Falló: No pude identificar el TOTAL de forma segura. Regístralo manualmente.")
     finally: await m.delete()
 
 # ==========================================
@@ -742,7 +775,7 @@ async def capturar_f_fecha(u: Update, cx: ContextTypes.DEFAULT_TYPE) -> int:
     ff = fc.strftime('%Y-%m-%d') if fc else datetime.datetime.now().strftime('%Y-%m-%d')
     est = 'Pendiente' if ff > datetime.datetime.now().strftime('%Y-%m-%d') else 'Completado'
     
-    ejecutar_sql("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha, categoria, estado, subcategoria, cuenta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", (f['tipo'], f['area'], f['concepto'], f['monto'], f['metodo'], ff, 'General', est, 'General', f['metodo']))
+    ejecutar_sql("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha, categoria, estado, subcategoria, cuenta, es_recordatorio) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", (f['tipo'], f['area'], f['concepto'], f['monto'], f['metodo'], ff, 'General', est, 'General', f['metodo'], False))
     alerta_presupuesto = procesar_impacto_financiero(f['monto'], f['tipo'], f['metodo'], 'General', est)
     
     msg = MSG_EXITO_FINANZA.format(concepto=f['concepto'].title(), monto=f['monto'], cat="General", cuenta=f['metodo'], fecha=ff, estado="⏳ Pendiente" if est == 'Pendiente' else "✅ Completado", alerta=alerta_presupuesto)
@@ -756,7 +789,7 @@ async def alerta_matutina(context: ContextTypes.DEFAULT_TYPE):
     hoy = datetime.date.today().strftime('%Y-%m-%d')
     tareas = ejecutar_sql("SELECT descripcion, prioridad FROM tareas WHERE fecha_calculada <= %s AND estado = 'Pendiente'", (hoy,), fetch_all=True) or []
     pagos = ejecutar_sql("SELECT concepto, monto, fecha FROM finanzas WHERE fecha <= %s AND estado = 'Pendiente'", (hoy,), fetch_all=True) or []
-    fins = ejecutar_sql("SELECT tipo, monto FROM finanzas WHERE fecha LIKE %s AND estado = 'Completado'", (f"{datetime.datetime.now().strftime('%Y-%m')}-%",), fetch_all=True) or []
+    fins = ejecutar_sql("SELECT tipo, monto FROM finanzas WHERE fecha LIKE %s AND estado = 'Completado' AND es_recordatorio = FALSE", (f"{datetime.datetime.now().strftime('%Y-%m')}-%",), fetch_all=True) or []
 
     ing = sum(f[1] for f in fins if f[0] == 'Ingreso')
     gas = sum(f[1] for f in fins if f[0] == 'Gasto')
@@ -774,7 +807,7 @@ async def alerta_semanal(context: ContextTypes.DEFAULT_TYPE):
     hace_7, hoy_str = (datetime.date.today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d'), datetime.date.today().strftime('%Y-%m-%d')
     creadas = (ejecutar_sql("SELECT COUNT(*) FROM tareas WHERE fecha_calculada BETWEEN %s AND %s", (hace_7, hoy_str), fetch_one=True) or [0])[0]
     comp = (ejecutar_sql("SELECT COUNT(*) FROM tareas WHERE fecha_completado BETWEEN %s AND %s", (hace_7, hoy_str), fetch_one=True) or [0])[0]
-    fins = ejecutar_sql("SELECT tipo, monto FROM finanzas WHERE fecha BETWEEN %s AND %s AND estado = 'Completado'", (hace_7, hoy_str), fetch_all=True) or []
+    fins = ejecutar_sql("SELECT tipo, monto FROM finanzas WHERE fecha BETWEEN %s AND %s AND estado = 'Completado' AND es_recordatorio = FALSE", (hace_7, hoy_str), fetch_all=True) or []
 
     ing = sum(f[1] for f in fins if f[0] == 'Ingreso')
     gas = sum(f[1] for f in fins if f[0] == 'Gasto')
@@ -796,11 +829,11 @@ if __name__ == '__main__':
     threading.Thread(target=iniciar_servidor, daemon=True).start()
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Handlers Configuración
+    # Handlers Configuración Dinámica y Herramientas Proactivas
     app.add_handler(CommandHandler("add_cuenta", add_cuenta))
     app.add_handler(CommandHandler("presupuesto", set_presupuesto))
     app.add_handler(CommandHandler("resumen", comando_resumen))
-    app.add_handler(CommandHandler("recalcular_saldos", recalcular_saldos)) # PARCHE 3
+    app.add_handler(CommandHandler("recalcular_saldos", recalcular_saldos))
 
     conv_handler_tarea = ConversationHandler(
         entry_points=[CallbackQueryHandler(iniciar_registro_tarea, pattern='^tarea_nueva$')],
@@ -829,5 +862,5 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.PHOTO, procesar_foto_local))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_texto_libre)) 
 
-    print("🤖 Súper Bot V19 INICIADO: Aprendizaje Seguro, Saldos y NLP Predictivo.")
+    print("🤖 Súper Bot V21 INICIADO: Módulo de Aprendizaje Limpio y Error Logging Integrado.")
     app.run_polling()
