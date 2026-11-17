@@ -49,7 +49,7 @@ class ServidorFantasma(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"ok" if self.path == "/health" else b"Bot Ejecutivo V21 (Produccion Final) Activo!")
+        self.wfile.write(b"ok" if self.path == "/health" else b"Bot Ejecutivo V24 (Blindaje Absoluto) Activo!")
 
 def iniciar_servidor():
     puerto = int(os.environ.get("PORT", 10000))
@@ -74,6 +74,7 @@ def ejecutar_sql(query, params=None, fetch_all=False, fetch_one=False):
     if not db_pool: return None
     conn = db_pool.getconn()
     res = None
+    c = None
     try:
         c = conn.cursor()
         c.execute(query, params or ())
@@ -82,10 +83,10 @@ def ejecutar_sql(query, params=None, fetch_all=False, fetch_one=False):
         else: conn.commit()
     except Exception as e:
         logging.error(f"SQL Error: {e}")
-        conn.rollback()
+        if conn: conn.rollback()
     finally:
-        c.close()
-        db_pool.putconn(conn)
+        if c: c.close()
+        if conn: db_pool.putconn(conn)
     return res
 
 def init_db():
@@ -101,8 +102,12 @@ def init_db():
         "errores (id SERIAL PRIMARY KEY, fecha TEXT, modulo TEXT, error TEXT)"
     ]
     for tabla in tablas: ejecutar_sql(f"CREATE TABLE IF NOT EXISTS {tabla}")
+    
     ejecutar_sql("CREATE INDEX IF NOT EXISTS idx_tareas_fecha ON tareas(fecha_calculada)")
+    ejecutar_sql("CREATE INDEX IF NOT EXISTS idx_tareas_estado ON tareas(estado)")
     ejecutar_sql("CREATE INDEX IF NOT EXISTS idx_finanzas_fecha ON finanzas(fecha)")
+    ejecutar_sql("CREATE INDEX IF NOT EXISTS idx_finanzas_estado ON finanzas(estado)")
+    ejecutar_sql("CREATE INDEX IF NOT EXISTS idx_finanzas_recordatorio ON finanzas(es_recordatorio)")
     
     ejecutar_sql("ALTER TABLE finanzas ADD COLUMN IF NOT EXISTS es_recordatorio BOOLEAN DEFAULT FALSE")
     ejecutar_sql("ALTER TABLE config_cuentas ADD COLUMN IF NOT EXISTS saldo REAL DEFAULT 0")
@@ -144,49 +149,59 @@ def registrar_auditoria(accion, detalle):
 def registrar_error(modulo, error_msg):
     fecha_ahora = datetime.datetime.now(ZoneInfo('America/Monterrey')).strftime('%Y-%m-%d %H:%M:%S')
     ejecutar_sql("INSERT INTO errores (fecha, modulo, error) VALUES (%s, %s, %s)", (fecha_ahora, modulo, error_msg))
+    ejecutar_sql("DELETE FROM errores WHERE id IN (SELECT id FROM errores ORDER BY id DESC OFFSET 5000)")
 
 # ==========================================
 # 4. EXPORTACIÓN PROFESIONAL Y RECALCULO DE SALDOS
 # ==========================================
 async def generar_y_enviar_backup(context: ContextTypes.DEFAULT_TYPE):
-    conn = get_db_connection()
-    c = conn.cursor()
+    conn = None
+    c = None
     archivos = []
-    for tabla in ['finanzas', 'tareas', 'habitos', 'presupuestos', 'errores']:
-        c.execute(f"SELECT * FROM {tabla}")
-        columnas = [desc[0] for desc in c.description]
-        datos = c.fetchall()
-        path_temp = f"/tmp/backup_{tabla}.csv"
-        with open(path_temp, mode='w', encoding='utf-8-sig', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(columnas)
-            writer.writerows(datos)
-        archivos.append(path_temp)
-    c.close()
-    db_pool.putconn(conn)
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        for tabla in ['finanzas', 'tareas', 'habitos', 'presupuestos', 'errores']:
+            c.execute(f"SELECT * FROM {tabla}")
+            columnas = [desc[0] for desc in c.description]
+            datos = c.fetchall()
+            path_temp = f"/tmp/backup_{tabla}.csv"
+            with open(path_temp, mode='w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(columnas)
+                writer.writerows(datos)
+            archivos.append(path_temp)
+    except Exception as e:
+        registrar_error("BACKUP", str(e))
+    finally:
+        if c: c.close()
+        if conn: db_pool.putconn(conn)
     
-    await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="📦 *Respaldo Automático Generado:*", parse_mode='Markdown')
-    for file_path in archivos:
-        await context.bot.send_document(chat_id=MI_TELEGRAM_ID, document=open(file_path, 'rb'))
-        os.remove(file_path)
+    if archivos:
+        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="📦 *Respaldo Automático Generado:*", parse_mode='Markdown')
+        for file_path in archivos:
+            # PARCHE 2: Cierre seguro de archivos
+            with open(file_path, 'rb') as f:
+                await context.bot.send_document(chat_id=MI_TELEGRAM_ID, document=f)
+            os.remove(file_path)
 
 async def comando_exportar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS: return
     m = await update.message.reply_text("⏳ Generando tu reporte y respaldos...")
     await generar_y_enviar_backup(context)
-    await m.delete()
+    try: await m.delete() # PARCHE 3
+    except Exception: pass
 
 async def recalcular_saldos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS: return
     ejecutar_sql("UPDATE config_cuentas SET saldo = 0")
-    # PARCHE 2: Recalcular saldos ignorando los recordatorios
     movimientos = ejecutar_sql("SELECT tipo, monto, cuenta FROM finanzas WHERE estado='Completado' AND es_recordatorio = FALSE", fetch_all=True) or []
     
     for tipo, monto, cuenta in movimientos:
         operador = "+" if tipo == "Ingreso" else "-"
         ejecutar_sql(f"UPDATE config_cuentas SET saldo = saldo {operador} %s WHERE LOWER(nombre) = LOWER(%s)", (monto, cuenta))
         
-    await update.message.reply_text("✅ Saldos recalculados correctamente desde el historial de movimientos.")
+    await update.message.reply_text("✅ Saldos recalculados correctamente desde el historial de movimientos reales.")
 
 # ==========================================
 # 5. COMANDOS DE CONFIGURACIÓN Y PRESUPUESTOS
@@ -218,7 +233,6 @@ async def comando_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tareas = ejecutar_sql("SELECT descripcion, prioridad FROM tareas WHERE fecha_calculada <= %s AND estado = 'Pendiente'", (hoy,), fetch_all=True) or []
     pagos = ejecutar_sql("SELECT concepto, monto, fecha, es_recordatorio FROM finanzas WHERE fecha <= %s AND estado = 'Pendiente'", (hoy,), fetch_all=True) or []
     
-    # PARCHE 3: Ignorar recordatorios en el dashboard mensual real
     fins = ejecutar_sql("SELECT tipo, monto FROM finanzas WHERE fecha LIKE %s AND estado = 'Completado' AND es_recordatorio = FALSE", (f"{mes_actual}-%",), fetch_all=True) or []
     cuentas = ejecutar_sql("SELECT saldo FROM config_cuentas WHERE saldo != 0", fetch_all=True) or []
     habito_top = ejecutar_sql("SELECT nombre, racha FROM habitos ORDER BY racha DESC LIMIT 1", fetch_one=True)
@@ -264,7 +278,7 @@ def procesar_impacto_financiero(monto, tipo, cuenta_nombre, subcat, estado):
         limite = ejecutar_sql("SELECT limite FROM presupuestos WHERE LOWER(categoria) = %s", (subcat.lower(),), fetch_one=True)
         if limite:
             mes_actual = datetime.datetime.now().strftime('%Y-%m')
-            gastado = ejecutar_sql("SELECT SUM(monto) FROM finanzas WHERE subcategoria = %s AND fecha LIKE %s AND estado = 'Completado'", (subcat, f"{mes_actual}-%"), fetch_one=True)[0] or 0
+            gastado = ejecutar_sql("SELECT SUM(monto) FROM finanzas WHERE subcategoria = %s AND fecha LIKE %s AND estado = 'Completado' AND es_recordatorio = FALSE", (subcat, f"{mes_actual}-%"), fetch_one=True)[0] or 0
             if gastado >= limite[0] * 0.85:
                 return f"\n⚠️ *¡Presupuesto al {(gastado / limite[0]) * 100:.0f}%!* Has gastado ${gastado:,.0f} de ${limite[0]:,.0f} en {subcat}."
     return ""
@@ -298,9 +312,9 @@ def responder_consulta_inteligente(texto_min):
         res = ejecutar_sql("SELECT descripcion, fecha_calculada FROM tareas WHERE estado='Pendiente' AND fecha_calculada != 'Recurrente' ORDER BY fecha_calculada ASC LIMIT 1", fetch_one=True)
         if res: respuesta += f"Tu tarea pendiente más antigua es **'{res[0]}'**, programada para el {res[1]}."
     elif "vence" in texto_min or "pendientes" in texto_min:
-        res = ejecutar_sql("SELECT concepto, monto, fecha FROM finanzas WHERE estado = 'Pendiente' ORDER BY fecha ASC", fetch_all=True)
+        res = ejecutar_sql("SELECT concepto, monto, fecha, es_recordatorio FROM finanzas WHERE estado = 'Pendiente' ORDER BY fecha ASC", fetch_all=True)
         if not res: respuesta += "No tienes pagos pendientes programados."
-        else: respuesta += "⏳ *Próximos Vencimientos:*\n" + "".join([f"▫️ {r[0]}: ${r[1]:,.2f} ({r[2]})\n" for r in res])
+        else: respuesta += "⏳ *Próximos Vencimientos:*\n" + "".join([f"▫️ {r[0]}: {'(Recordatorio)' if r[3] else f'${r[1]:,.2f}'} ({r[2]})\n" for r in res])
     elif "promedio" in texto_min and "mensual" in texto_min:
         res = ejecutar_sql("SELECT AVG(mensual) FROM (SELECT SUM(monto) as mensual FROM finanzas WHERE tipo='Gasto' AND estado='Completado' AND es_recordatorio = FALSE GROUP BY substr(fecha, 1, 7)) as sub", fetch_one=True)
         prom = res[0] if res and res[0] else 0
@@ -351,9 +365,12 @@ def analizar_texto_local(texto):
         estado_f = 'Pendiente' if (fecha_calc > hoy_str or monto == 0.0) else 'Completado'
         es_recordatorio_fin = (monto == 0.0)
         
+        # PARCHE 1: Default de cuenta estable
         cuenta_detectada = 'Efectivo'
         for c_low, c_orig in CACHE_CUENTAS.items(): 
-            if c_low in texto_min: cuenta_detectada = c_orig; break
+            if c_low in texto_min: 
+                cuenta_detectada = c_orig
+                break
             
         subcat = 'General'
         for c_key, c_orig in CACHE_CATEGORIAS.items():
@@ -463,12 +480,16 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif query.data.startswith('pagar_f_'):
         id_pago = query.data.split('_')[2]
-        info = ejecutar_sql("SELECT monto, tipo, cuenta, subcategoria, estado FROM finanzas WHERE id = %s", (id_pago,), fetch_one=True)
+        info = ejecutar_sql("SELECT monto, tipo, cuenta, subcategoria, estado, es_recordatorio, concepto FROM finanzas WHERE id = %s", (id_pago,), fetch_one=True)
         if info and info[4] == 'Pendiente':
-            ejecutar_sql("UPDATE finanzas SET estado = 'Completado', fecha = %s WHERE id = %s", (datetime.date.today().strftime('%Y-%m-%d'), id_pago))
-            alerta_presupuesto = procesar_impacto_financiero(info[0], info[1], info[2], info[3], 'Completado')
-            registrar_auditoria("PAGO_REALIZADO", f"ID {id_pago}")
-            await query.edit_message_text(f"💸 Pago marcado como realizado.{alerta_presupuesto}", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú", callback_data='volver_inicio')]]))
+            if info[5]: 
+                ejecutar_sql("DELETE FROM finanzas WHERE id = %s", (id_pago,))
+                await query.edit_message_text(f"🔔 *'{info[6]}'* era un recordatorio sin monto.\nLo he borrado de pendientes. Por favor, registra el pago real dictándome o escribiendo:\n_\"Pagué X pesos de {info[6]}\"_", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú", callback_data='volver_inicio')]]))
+            else:
+                ejecutar_sql("UPDATE finanzas SET estado = 'Completado', fecha = %s WHERE id = %s", (datetime.date.today().strftime('%Y-%m-%d'), id_pago))
+                alerta_presupuesto = procesar_impacto_financiero(info[0], info[1], info[2], info[3], 'Completado')
+                registrar_auditoria("PAGO_REALIZADO", f"ID {id_pago}")
+                await query.edit_message_text(f"💸 Pago marcado como realizado.{alerta_presupuesto}", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú", callback_data='volver_inicio')]]))
         else:
             await query.edit_message_text("Este pago ya fue procesado o no existe.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú", callback_data='volver_inicio')]]))
 
@@ -507,7 +528,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         for r in registros:
             if r[5] == 'Pendiente': pendientes.append(r)
-            elif not r[7]: # Solo sumar finanzas reales
+            elif not r[7]: 
                 if r[0] == 'Ingreso' and r[1] == 'Empresa': ing_emp += r[2]
                 elif r[0] == 'Gasto' and r[1] == 'Empresa': gas_emp += r[2]
                 elif r[0] == 'Ingreso' and r[1] == 'Personal': ing_per += r[2]
@@ -528,21 +549,20 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
         await query.edit_message_text(mensaje, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='menu_finanzas')]]))
 
-    # APRENDIZAJE INTERACTIVO (PARCHE 1)
+    # APRENDIZAJE INTERACTIVO
     elif query.data.startswith('aprender_'):
         categoria = "Empresa" if query.data == 'aprender_empresa' else "Personal"
         datos = context.user_data.get('pendiente_clasificar')
         if datos:
             texto_aprender = datos.get('palabra_clave') or datos.get('concepto') or datos.get('descripcion')
             palabra = obtener_palabra_aprendizaje(texto_aprender)
-            
             if palabra:
                 ejecutar_sql("INSERT INTO diccionario (palabra, categoria) VALUES (%s, %s) ON CONFLICT DO NOTHING", (palabra.lower(), categoria))
                 recargar_cache()
                 datos['area' if datos['tipo_registro'] == 'finanza' else 'tipo'] = categoria
                 await guardar_datos_nlp(context.bot, MI_TELEGRAM_ID, datos)
             else:
-                await query.edit_message_text("⚠️ No encontré una palabra útil para aprender automáticamente.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]))
+                await query.edit_message_text("⚠️ No encontré una palabra útil para el aprendizaje.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]))
             context.user_data.pop('pendiente_clasificar', None)
             
     # EDITAR / BORRAR
@@ -611,8 +631,6 @@ async def manejar_resultado_analisis(update, context, datos):
     area = datos.get('area') or datos.get('tipo')
     if area == "Desconocida":
         context.user_data['pendiente_clasificar'] = datos
-        
-        # PARCHE 1: Mostrar en UI solo la palabra limpia
         texto_aprender = datos.get('palabra_clave') or datos.get('concepto') or datos.get('descripcion')
         palabra = obtener_palabra_aprendizaje(texto_aprender)
         
@@ -631,7 +649,9 @@ async def procesar_texto_libre(update: Update, context: ContextTypes.DEFAULT_TYP
     if update.effective_user.id not in ALLOWED_USERS: return
     m = await update.message.reply_text("🧠 *Procesando...*", parse_mode='Markdown')
     await manejar_resultado_analisis(update, context, analizar_texto_local(update.message.text))
-    await m.delete()
+    # PARCHE 3: Eliminación segura de mensajes temporales
+    try: await m.delete()
+    except Exception: pass
 
 async def procesar_audio_local(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS: return
@@ -639,52 +659,65 @@ async def procesar_audio_local(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(MSG_AUDIO_LARGO, reply_markup=obtener_menu_principal()); return
 
     m = await update.message.reply_text("🎙️ *Transcribiendo...*", parse_mode='Markdown')
+    temp_audio_path = ""
+    wav_path = ""
     try:
         archivo = await context.bot.get_file(update.message.voice.file_id)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as temp_audio:
-            await archivo.download_to_drive(temp_audio.name)
-            wav_path = temp_audio.name.replace(".ogg", ".wav")
-            AudioSegment.from_ogg(temp_audio.name).export(wav_path, format="wav")
-            with sr.AudioFile(wav_path) as source: 
-                texto = sr.Recognizer().recognize_google(sr.Recognizer().record(source), language="es-MX")
+            temp_audio_path = temp_audio.name
             
-            # PARCHE 4: Validar audios basura/vacíos
-            if len(texto.strip()) < 3:
-                raise Exception("Audio vacío o ininteligible")
-                
-            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"🗣️ _\"{texto}\"_", parse_mode='Markdown')
-            await manejar_resultado_analisis(update, context, analizar_texto_local(texto))
-            os.remove(temp_audio.name)
-            os.remove(wav_path)
+        await archivo.download_to_drive(temp_audio_path)
+        wav_path = temp_audio_path.replace(".ogg", ".wav")
+        AudioSegment.from_ogg(temp_audio_path).export(wav_path, format="wav")
+        
+        with sr.AudioFile(wav_path) as source: 
+            texto = sr.Recognizer().recognize_google(sr.Recognizer().record(source), language="es-MX")
+        
+        if len(texto.strip()) < 3:
+            raise Exception("Audio vacío o ininteligible")
+            
+        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"🗣️ _\"{texto}\"_", parse_mode='Markdown')
+        await manejar_resultado_analisis(update, context, analizar_texto_local(texto))
+        
     except Exception as e:
         registrar_error("AUDIO", str(e))
         await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=MSG_ERROR)
-    finally: await m.delete()
+    finally: 
+        # PARCHE 2: Eliminación segura de temporales
+        if temp_audio_path and os.path.exists(temp_audio_path): os.remove(temp_audio_path)
+        if wav_path and os.path.exists(wav_path): os.remove(wav_path)
+        try: await m.delete()
+        except Exception: pass
 
 async def procesar_foto_local(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS: return
-    m = await update.message.reply_text("📸 *Escaneando OCR...*", parse_mode='Markdown')
+    m = await update.message.reply_text("📸 *Escaneando OCR (Modo Seguro)...*", parse_mode='Markdown')
+    temp_foto_path = ""
     try:
         archivo = await context.bot.get_file(update.message.photo[-1].file_id)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_foto:
-            await archivo.download_to_drive(temp_foto.name)
-            img = Image.open(temp_foto.name).convert('L')
-            img.thumbnail((1200, 1200)) 
-            texto_crudo = pytesseract.image_to_string(img, lang='spa')
+            temp_foto_path = temp_foto.name
             
-            monto = ""
-            match = re.search(r'(?:total|importe)[\s\$:]*([\d,]+\.\d{2})', texto_crudo, re.IGNORECASE)
-            if match: 
-                monto = match.group(1)
-            else:
-                raise Exception("No se detectó un monto 'TOTAL' seguro en el ticket.")
-            
-            await manejar_resultado_analisis(update, context, analizar_texto_local(f"ticket pagué {monto} {texto_crudo[:300]}"))
-            os.remove(temp_foto.name)
+        await archivo.download_to_drive(temp_foto_path)
+        img = Image.open(temp_foto_path).convert('L')
+        img.thumbnail((1200, 1200)) 
+        texto_crudo = pytesseract.image_to_string(img, lang='spa')
+        
+        monto = ""
+        match = re.search(r'(?:total|importe)[\s\$:]*([\d,]+\.\d{2})', texto_crudo, re.IGNORECASE)
+        if match: 
+            monto = match.group(1)
+        else:
+            raise Exception("No se detectó un monto 'TOTAL' seguro en el ticket.")
+        
+        await manejar_resultado_analisis(update, context, analizar_texto_local(f"ticket pagué {monto} {texto_crudo[:300]}"))
     except Exception as e: 
         registrar_error("OCR", str(e))
         await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"⚠️ OCR Falló: No pude identificar el TOTAL de forma segura. Regístralo manualmente.")
-    finally: await m.delete()
+    finally: 
+        if temp_foto_path and os.path.exists(temp_foto_path): os.remove(temp_foto_path)
+        try: await m.delete()
+        except Exception: pass
 
 # ==========================================
 # 9. REGISTRO MANUAL
@@ -738,7 +771,7 @@ async def capturar_notas(u: Update, cx: ContextTypes.DEFAULT_TYPE) -> int:
     else: await u.message.reply_text(msg, parse_mode='Markdown', reply_markup=obtener_menu_principal())
     return ConversationHandler.END
 
-# ---- FINANZAS ----
+# ---- FINANZAS MANUAL ----
 async def iniciar_finanzas(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     await u.callback_query.answer()
     c.user_data['nueva_finanza'] = {'tipo': "Gasto" if u.callback_query.data == 'finanza_gasto' else "Ingreso"}
@@ -751,7 +784,7 @@ async def capturar_f_area(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     return F_CONCEPTO
 async def capturar_f_concepto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     c.user_data['nueva_finanza']['concepto'] = u.message.text
-    await u.message.reply_text("💵 *Monto:*", parse_mode='Markdown')
+    await u.message.reply_text("💵 *Monto numérico:*", parse_mode='Markdown')
     return F_MONTO
 async def capturar_f_monto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     try: c.user_data['nueva_finanza']['monto'] = float(u.message.text)
@@ -759,14 +792,19 @@ async def capturar_f_monto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
         await u.message.reply_text("⚠️ Solo números:")
         return F_MONTO 
     if c.user_data['nueva_finanza']['tipo'] == "Gasto":
-        await u.message.reply_text("💳 *Método:*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Tarjeta", callback_data='f_tarjeta'), InlineKeyboardButton("Efectivo", callback_data='f_efectivo')]]), parse_mode='Markdown')
+        teclado = []
+        cuentas = list(CACHE_CUENTAS.values())
+        for i in range(0, len(cuentas), 2):
+            fila = [InlineKeyboardButton(cta, callback_data=f'f_cta_{cta}') for cta in cuentas[i:i+2]]
+            teclado.append(fila)
+        await u.message.reply_text("💳 *Cuenta/Método:*", reply_markup=InlineKeyboardMarkup(teclado), parse_mode='Markdown')
         return F_METODO
     c.user_data['nueva_finanza']['metodo'] = "N/A"
     await u.message.reply_text("📅 *Fecha:*", parse_mode='Markdown')
     return F_FECHA
 async def capturar_f_metodo(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     await u.callback_query.answer()
-    c.user_data['nueva_finanza']['metodo'] = "Tarjeta" if u.callback_query.data == 'f_tarjeta' else "Efectivo"
+    c.user_data['nueva_finanza']['metodo'] = u.callback_query.data.replace('f_cta_', '')
     await u.callback_query.edit_message_text("📅 *Fecha:*", parse_mode='Markdown')
     return F_FECHA
 async def capturar_f_fecha(u: Update, cx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -829,7 +867,6 @@ if __name__ == '__main__':
     threading.Thread(target=iniciar_servidor, daemon=True).start()
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Handlers Configuración Dinámica y Herramientas Proactivas
     app.add_handler(CommandHandler("add_cuenta", add_cuenta))
     app.add_handler(CommandHandler("presupuesto", set_presupuesto))
     app.add_handler(CommandHandler("resumen", comando_resumen))
@@ -842,7 +879,7 @@ if __name__ == '__main__':
     )
     conv_handler_finanzas = ConversationHandler(
         entry_points=[CallbackQueryHandler(iniciar_finanzas, pattern='^finanza_gasto$|^finanza_ingreso$')],
-        states={F_AREA: [CallbackQueryHandler(capturar_f_area, pattern='^f_')], F_CONCEPTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_f_concepto)], F_MONTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_f_monto)], F_METODO: [CallbackQueryHandler(capturar_f_metodo, pattern='^f_')], F_FECHA: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_f_fecha)]},
+        states={F_AREA: [CallbackQueryHandler(capturar_f_area, pattern='^f_')], F_CONCEPTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_f_concepto)], F_MONTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_f_monto)], F_METODO: [CallbackQueryHandler(capturar_f_metodo, pattern='^f_cta_')], F_FECHA: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_f_fecha)]},
         fallbacks=[CommandHandler('cancelar', cancelar_registro)], per_message=False
     )
     conv_handler_habito = ConversationHandler(
@@ -862,5 +899,5 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.PHOTO, procesar_foto_local))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_texto_libre)) 
 
-    print("🤖 Súper Bot V21 INICIADO: Módulo de Aprendizaje Limpio y Error Logging Integrado.")
+    print("🤖 Súper Bot V24 INICIADO: Blindaje Absoluto Anti-Crashes.")
     app.run_polling()
