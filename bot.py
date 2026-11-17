@@ -4,14 +4,18 @@ import psycopg2
 import datetime
 from zoneinfo import ZoneInfo
 import dateparser
-import json
+from dateparser.search import search_dates
 import os
 import tempfile
 import threading
+import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from google import genai
-from google.genai import types
+import speech_recognition as sr
+from pydub import AudioSegment
+import pytesseract
+from PIL import Image
+
 from collections import defaultdict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
@@ -19,13 +23,10 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 # --- CONFIGURACIÓN DE CLAVES ---
 TOKEN = '9156918216:AAG4dC_F7iB3SGiq1IsXrevJAbFIHD0iLIo'
 MI_TELEGRAM_ID = 6612216260
-GEMINI_API_KEY = 'AQ.Ab8RN6K_dcsTxsYsc_y4yke47Kogk-ZcpTGHnBrncQLaC9FbrQ'
 DATABASE_URL = 'postgresql://neondb_owner:npg_zPubRs28rxml@ep-plain-bar-bfya12gv-pooler.c-5.us-west-2.aws.neon.tech/neondb?sslmode=require'
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
-datos_usuario = {}
 
 # Estados para los menús manuales
 T_DESCRIPCION, T_TIPO, T_PRIORIDAD, T_FECHA, T_NOTAS = range(5)
@@ -39,7 +40,7 @@ class ServidorFantasma(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot de Telegram Activo y Escuchando!")
+        self.wfile.write(b"Bot de Telegram Activo con NLP Local!")
 
 def iniciar_servidor():
     puerto = int(os.environ.get("PORT", 10000))
@@ -47,32 +48,50 @@ def iniciar_servidor():
     servidor.serve_forever()
 
 # ==========================================
-# CONFIGURACIÓN DE IA CON MEMORIA
+# MOTOR NLP: DICCIONARIOS Y HEURÍSTICA
 # ==========================================
-try:
-    with open('Planificador de tareas.txt', 'r', encoding='utf-8') as f:
-        planificador_contexto = f.read()
-except FileNotFoundError:
-    planificador_contexto = "El usuario no ha subido el archivo. Actúa con sentido común."
+PALABRAS_EMPRESA = ['viático', 'viaticos', 'vuelo', 'gasolina', 'uber', 'taxi', 'hotel', 'comida', 'cliente', 'papelería', 'oficina', 'reporte', 'junta', 'reunión', 'auditoría', 'proveedor', 'proyecto', 'empresa', 'trabajo', 'jefe']
+PALABRAS_PERSONAL = ['despensa', 'super', 'súper', 'luz', 'agua', 'internet', 'cfe', 'renta', 'restaurante', 'cine', 'ropa', 'basura', 'casa', 'médico', 'cita', 'gimnasio', 'membresía', 'personal', 'comida', 'antojo']
+PALABRAS_GASTO = ['pagué', 'pague', 'compré', 'compre', 'gasté', 'gaste', 'costó', 'costo', 'ticket', 'recibo', 'factura', 'mensualidad', 'suscripción']
+PALABRAS_INGRESO = ['deposité', 'deposite', 'transferí', 'cobre', 'cobré', 'sueldo', 'pagaron', 'ingreso', 'reembolso', 'pago']
 
-cliente_ia = genai.Client(api_key=GEMINI_API_KEY)
+def extraer_fecha(texto):
+    fechas_encontradas = search_dates(texto, languages=['es'])
+    if fechas_encontradas:
+        return fechas_encontradas[0][1].strftime('%Y-%m-%d')
+    return None
 
-instruccion_sistema = f"""
-Eres un asistente personal organizador inteligente con memoria de conversación. Analiza la entrada del usuario (texto, audio o ticket).
-Toma en cuenta su documento "Planificador de tareas" para entender su contexto:
-
---- INICIO PLANIFICADOR ---
-{planificador_contexto}
---- FIN PLANIFICADOR ---
-
-REGLA 1 (APRENDIZAJE): Si el usuario te pide registrar algo que es ambiguo, le falta el monto/fecha, o no encaja en las categorías del Planificador, NO generes JSON. En su lugar, respóndele en texto plano con una pregunta breve y directa para aclarar la duda.
-REGLA 2 (GUARDADO): Si ya tienes toda la información clara, devuelve ÚNICAMENTE un objeto JSON válido, sin comillas invertidas ni texto adicional.
-
-Formato Tarea: {{"tipo_registro": "tarea", "descripcion": "string", "tipo": "Empresa" o "Personal", "prioridad": "Urgente" o "Rutina", "fecha_original": "string", "notas": "string"}}
-Formato Finanza: {{"tipo_registro": "finanza", "tipo": "Gasto" o "Ingreso", "area": "Empresa" o "Personal", "concepto": "string", "monto": numero_float, "metodo": "Tarjeta" o "Efectivo", "fecha": "string"}}
-"""
-config_ia = types.GenerateContentConfig(system_instruction=instruccion_sistema)
-chat_ia = cliente_ia.chats.create(model='gemini-3.8-flash', config=config_ia)
+def analizar_texto_local(texto):
+    texto_min = texto.lower()
+    
+    # 1. Puntuación de Contexto
+    score_emp = sum(1 for p in PALABRAS_EMPRESA if p in texto_min)
+    score_per = sum(1 for p in PALABRAS_PERSONAL if p in texto_min)
+    area = "Empresa" if score_emp > score_per else "Personal"
+    
+    # 2. Detectar intención financiera
+    es_gasto = any(p in texto_min for p in PALABRAS_GASTO)
+    es_ingreso = any(p in texto_min for p in PALABRAS_INGRESO)
+    
+    # Buscar montos (ej. 500, $500.50, 500 pesos)
+    match_monto = re.search(r'\$?\s*(\d+(?:\.\d{1,2})?)\b(?:\s*pesos?)?', texto_min)
+    
+    # Si hay palabras financieras y un número, es FINANZA
+    if (es_gasto or es_ingreso or '$' in texto_min) and match_monto:
+        tipo_finanza = "Ingreso" if es_ingreso and not es_gasto else "Gasto"
+        monto = float(match_monto.group(1))
+        fecha_calc = extraer_fecha(texto) or datetime.date.today().strftime('%Y-%m-%d')
+        
+        # Limpiar concepto
+        concepto = re.sub(r'\$?\s*(\d+(?:\.\d{1,2})?)\b(?:\s*pesos?)?', '', texto, flags=re.IGNORECASE).strip()
+        if not concepto: concepto = "Registro general"
+        
+        return {"tipo_registro": "finanza", "tipo": tipo_finanza, "area": area, "concepto": concepto[:40], "monto": monto, "metodo": "Efectivo", "fecha": fecha_calc}
+    
+    # 3. Si no es finanza, es TAREA
+    prioridad = "Urgente" if "urgente" in texto_min else "Rutina"
+    fecha_calc = extraer_fecha(texto) or "Recurrente"
+    return {"tipo_registro": "tarea", "descripcion": texto[:60], "tipo": area, "prioridad": prioridad, "fecha_original": texto, "fecha_calculada": fecha_calc, "notas": ""}
 
 # ==========================================
 # BASE DE DATOS (POSTGRESQL NEON)
@@ -113,119 +132,105 @@ async def alerta_matutina(context: ContextTypes.DEFAULT_TYPE):
     if not tareas_hoy:
         mensaje += "No tienes actividades programadas. ¡Aprovecha el día!"
     else:
-        for t in tareas_hoy:
-            mensaje += f"▫️ {t[0]} ({t[1]} - {t[2]})\n"
+        for t in tareas_hoy: mensaje += f"▫️ {t[0]} ({t[1]} - {t[2]})\n"
     await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=mensaje, parse_mode='Markdown')
 
 async def alerta_nocturna(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="🌙 *Corte de caja.* \nMomento de revisar pendientes y desconectar. ¿Cómo te fue hoy?", parse_mode='Markdown')
 
 # ==========================================
-# PROCESAMIENTO DE IA CON MANEJO DE ERRORES
+# PROCESAMIENTO NLP: TEXTO, AUDIO Y FOTOS
 # ==========================================
-async def procesar_respuesta_ia(bot, chat_id, respuesta_texto):
-    texto_limpio = respuesta_texto.replace('```json', '').replace('```', '').strip()
-    
-    if texto_limpio.startswith('{') and texto_limpio.endswith('}'):
-        try:
-            datos = json.loads(texto_limpio)
-            conn = get_db_connection()
-            c = conn.cursor()
-            
-            if datos.get('tipo_registro') == 'tarea':
-                fecha_calc = dateparser.parse(datos.get('fecha_original', ''), languages=['es'])
-                fecha_str = fecha_calc.strftime('%Y-%m-%d') if fecha_calc else "Recurrente"
-                c.execute("INSERT INTO tareas (descripcion, tipo, prioridad, fecha_original, fecha_calculada, notas) VALUES (%s, %s, %s, %s, %s, %s)",
-                          (datos.get('descripcion'), datos.get('tipo'), datos.get('prioridad'), datos.get('fecha_original'), fecha_str, datos.get('notas', '')))
-                mensaje = f"✅ *Tarea guardada con IA*\n📌 {datos.get('descripcion')}\n⏰ Para: {fecha_str} ({datos.get('tipo')})"
-                
-            elif datos.get('tipo_registro') == 'finanza':
-                fecha_calc = dateparser.parse(datos.get('fecha', ''), languages=['es'])
-                fecha_str = fecha_calc.strftime('%Y-%m-%d') if fecha_calc else datetime.date.today().strftime('%Y-%m-%d')
-                c.execute("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha) VALUES (%s, %s, %s, %s, %s, %s)",
-                          (datos.get('tipo'), datos.get('area'), datos.get('concepto'), datos.get('monto'), datos.get('metodo'), fecha_str))
-                mensaje = f"✅ *Finanza guardada con IA*\n💰 {datos.get('tipo')}: ${datos.get('monto')} en {datos.get('concepto')} ({datos.get('area')})"
-            
-            conn.commit()
-            conn.close()
-            await bot.send_message(chat_id=chat_id, text=mensaje, parse_mode='Markdown', reply_markup=obtener_menu_principal())
-            return
-        except Exception:
-            pass
-            
-    await bot.send_message(chat_id=chat_id, text=f"🤖 {respuesta_texto}", parse_mode='Markdown')
+async def guardar_datos_nlp(bot, chat_id, datos):
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        if datos['tipo_registro'] == 'tarea':
+            c.execute("INSERT INTO tareas (descripcion, tipo, prioridad, fecha_original, fecha_calculada, notas) VALUES (%s, %s, %s, %s, %s, %s)",
+                      (datos['descripcion'], datos['tipo'], datos['prioridad'], datos['fecha_original'], datos['fecha_calculada'], datos['notas']))
+            mensaje = f"✅ *Tarea guardada (NLP)*\n📌 {datos['descripcion']}\n⏰ Para: {datos['fecha_calculada']} ({datos['tipo']})"
+        elif datos['tipo_registro'] == 'finanza':
+            c.execute("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha) VALUES (%s, %s, %s, %s, %s, %s)",
+                      (datos['tipo'], datos['area'], datos['concepto'], datos['monto'], datos['metodo'], datos['fecha']))
+            mensaje = f"✅ *Finanza guardada (NLP)*\n💰 {datos['tipo']}: ${datos['monto']} en {datos['concepto']} ({datos['area']})"
+        conn.commit()
+        conn.close()
+        await bot.send_message(chat_id=chat_id, text=mensaje, parse_mode='Markdown', reply_markup=obtener_menu_principal())
+    except Exception as e:
+        await bot.send_message(chat_id=chat_id, text="⚠️ *No pude entender la instrucción clara.* Por favor, usa el Menú Manual.", parse_mode='Markdown', reply_markup=obtener_menu_principal())
 
-async def procesar_texto_libre_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def procesar_texto_libre(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MI_TELEGRAM_ID: return
     texto = update.message.text
-    m = await update.message.reply_text("🧠 *Pensando...*", parse_mode='Markdown')
-    try:
-        respuesta = chat_ia.send_message(texto)
-        await procesar_respuesta_ia(context.bot, MI_TELEGRAM_ID, respuesta.text)
-    except Exception as e:
-        error_real = str(e)
-        if "503" in error_real or "UNAVAILABLE" in error_real:
-            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="⏳ *Servidores de IA saturados momentáneamente.*", parse_mode='Markdown')
-        else:
-            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"⚠️ *Error técnico de IA:* {error_real}\n\nUsa el menú manual por ahora.", parse_mode='Markdown')
-    finally:
-        try: await m.delete()
-        except: pass
+    m = await update.message.reply_text("🧠 *Analizando...*", parse_mode='Markdown')
+    datos = analizar_texto_local(texto)
+    await guardar_datos_nlp(context.bot, MI_TELEGRAM_ID, datos)
+    await m.delete()
 
-async def procesar_audio_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def procesar_audio_local(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MI_TELEGRAM_ID: return
-    m = await update.message.reply_text("🎙️ *Transcribiendo con IA...*", parse_mode='Markdown')
+    m = await update.message.reply_text("🎙️ *Escuchando y analizando...*", parse_mode='Markdown')
+    
     try:
         archivo = await context.bot.get_file(update.message.voice.file_id)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as temp_audio:
             await archivo.download_to_drive(temp_audio.name)
-            archivo_gemini = cliente_ia.files.upload(file=temp_audio.name, config={'mime_type': 'audio/ogg'})
             
-            respuesta = chat_ia.send_message([archivo_gemini, "Extrae los datos de este audio. Si te falta información, pregúntame."])
-            await procesar_respuesta_ia(context.bot, MI_TELEGRAM_ID, respuesta.text)
+            # Convertir OGG a WAV con pydub
+            wav_path = temp_audio.name.replace(".ogg", ".wav")
+            audio = AudioSegment.from_ogg(temp_audio.name)
+            audio.export(wav_path, format="wav")
             
-            cliente_ia.files.delete(name=archivo_gemini.name)
+            # Reconocimiento de voz local/gratuito
+            r = sr.Recognizer()
+            with sr.AudioFile(wav_path) as source:
+                audio_data = r.record(source)
+                texto_transcrito = r.recognize_google(audio_data, language="es-MX")
+            
+            # Analizar el texto resultante
+            datos = analizar_texto_local(texto_transcrito)
+            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"🗣️ _\"{texto_transcrito}\"_", parse_mode='Markdown')
+            await guardar_datos_nlp(context.bot, MI_TELEGRAM_ID, datos)
+            
             os.remove(temp_audio.name)
+            os.remove(wav_path)
+    except sr.UnknownValueError:
+        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="⚠️ No pude entender el audio. Usa texto o el Menú Manual.", reply_markup=obtener_menu_principal())
     except Exception as e:
-        error_real = str(e)
-        if "503" in error_real or "UNAVAILABLE" in error_real:
-            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="⏳ *Servidores de IA saturados momentáneamente.*", parse_mode='Markdown')
-        else:
-            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"⚠️ *Error técnico de IA:* {error_real}\n\nUsa el menú manual por ahora.", parse_mode='Markdown')
+        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"⚠️ Error al procesar audio: {e}", reply_markup=obtener_menu_principal())
     finally:
-        try: await m.delete()
-        except: pass
+        await m.delete()
 
-async def procesar_foto_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def procesar_foto_local(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MI_TELEGRAM_ID: return
-    m = await update.message.reply_text("📸 *Analizando ticket con IA...*", parse_mode='Markdown')
+    m = await update.message.reply_text("📸 *Escaneando ticket con OCR...*", parse_mode='Markdown')
+    
     try:
         archivo = await context.bot.get_file(update.message.photo[-1].file_id)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_foto:
             await archivo.download_to_drive(temp_foto.name)
-            archivo_gemini = cliente_ia.files.upload(file=temp_foto.name, config={'mime_type': 'image/jpeg'})
             
-            respuesta = chat_ia.send_message([archivo_gemini, "Extrae los datos de este ticket. Si te falta saber si es de empresa o personal, pregúntame."])
-            await procesar_respuesta_ia(context.bot, MI_TELEGRAM_ID, respuesta.text)
+            # Extraer texto de la imagen con Tesseract
+            img = Image.open(temp_foto.name)
+            texto_extraido = pytesseract.image_to_string(img, lang='spa')
             
-            cliente_ia.files.delete(name=archivo_gemini.name)
+            # Forzamos una palabra clave financiera para ayudar al NLP
+            texto_ticket = f"ticket pagué {texto_extraido}"
+            datos = analizar_texto_local(texto_ticket)
+            
+            await guardar_datos_nlp(context.bot, MI_TELEGRAM_ID, datos)
             os.remove(temp_foto.name)
     except Exception as e:
-        error_real = str(e)
-        if "503" in error_real or "UNAVAILABLE" in error_real:
-            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="⏳ *Servidores de IA saturados momentáneamente.*", parse_mode='Markdown')
-        else:
-            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"⚠️ *Error técnico de IA:* {error_real}\n\nUsa el menú manual por ahora.", parse_mode='Markdown')
+        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="⚠️ No pude leer los datos de la foto. Usa el Menú Manual.", reply_markup=obtener_menu_principal())
     finally:
-        try: await m.delete()
-        except: pass
+        await m.delete()
 
 # ==========================================
-# MENÚS GENERALES Y BALANCE
+# MENÚS GENERALES Y BALANCE (MANUAL INTACTO)
 # ==========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_user.id != MI_TELEGRAM_ID: return ConversationHandler.END
-    await update.message.reply_text("¡Hola! Háblame, mándame fotos o usa el menú manual:", reply_markup=obtener_menu_principal())
+    await update.message.reply_text("¡Hola! Háblame, mándame fotos, audios o usa el menú manual:", reply_markup=obtener_menu_principal())
     return ConversationHandler.END
 
 async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -234,7 +239,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await query.answer() 
 
     if query.data == 'menu_tarea':
-        await query.edit_message_text("Módulo de Tareas. ¿Qué haremos?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Registrar manual", callback_data='tarea_nueva')], [InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]))
+        await query.edit_message_text("Módulo de Tareas:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Registrar manual", callback_data='tarea_nueva')], [InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]))
     elif query.data == 'menu_finanzas':
         teclado = [
             [InlineKeyboardButton("💸 Gasto Manual", callback_data='finanza_gasto'), InlineKeyboardButton("💵 Ingreso Manual", callback_data='finanza_ingreso')],
@@ -457,16 +462,16 @@ if __name__ == '__main__':
         per_message=False
     )
 
-    # Añadir Handlers (El orden importa: ConversationHandlers primero, texto libre IA al final)
+    # Añadir Handlers (El orden importa: ConversationHandlers primero, texto libre NLP al final)
     app.add_handler(conv_handler_tarea)
     app.add_handler(conv_handler_finanzas)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(manejador_botones)) 
     
-    # Handlers de IA
-    app.add_handler(MessageHandler(filters.VOICE, procesar_audio_ia))
-    app.add_handler(MessageHandler(filters.PHOTO, procesar_foto_ia))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_texto_libre_ia)) 
+    # Handlers de NLP Local
+    app.add_handler(MessageHandler(filters.VOICE, procesar_audio_local))
+    app.add_handler(MessageHandler(filters.PHOTO, procesar_foto_local))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_texto_libre)) 
 
-    print("🤖 Súper Bot iniciado: IA Conversacional + Menú Manual Completo + BD en Nube.")
+    print("🤖 Súper Bot iniciado: NLP Local + Menú Manual + DB PostgreSQL.")
     app.run_polling()
