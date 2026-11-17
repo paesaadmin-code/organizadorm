@@ -19,7 +19,7 @@ from pydub import AudioSegment
 import pytesseract
 from PIL import Image
 from collections import defaultdict
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputDocument
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 # ==========================================
@@ -49,7 +49,7 @@ class ServidorFantasma(BaseHTTPRequestHandler):
         else:
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b"Bot NLP V12 (Limpieza Extrema) Activo!")
+            self.wfile.write(b"Bot Ejecutivo V13 (Dashboard, Cuentas, Backups) Activo!")
 
 def iniciar_servidor():
     puerto = int(os.environ.get("PORT", 10000))
@@ -81,9 +81,12 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS historial (id SERIAL PRIMARY KEY, fecha TEXT, accion TEXT, detalle TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS habitos (id SERIAL PRIMARY KEY, nombre TEXT, racha INTEGER DEFAULT 0, ultima_fecha TEXT)''')
     
+    # MIGRACIONES SEGURAS (Añadiendo Cuentas y Subcategorías)
     c.execute('''ALTER TABLE tareas ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'Pendiente' ''')
     c.execute('''ALTER TABLE tareas ADD COLUMN IF NOT EXISTS fecha_completado TEXT ''')
     c.execute('''ALTER TABLE finanzas ADD COLUMN IF NOT EXISTS categoria TEXT DEFAULT 'General' ''')
+    c.execute('''ALTER TABLE finanzas ADD COLUMN IF NOT EXISTS subcategoria TEXT DEFAULT 'General' ''')
+    c.execute('''ALTER TABLE finanzas ADD COLUMN IF NOT EXISTS cuenta TEXT DEFAULT 'Efectivo' ''')
     c.execute('''ALTER TABLE finanzas ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'Completado' ''')
     
     c.execute("CREATE INDEX IF NOT EXISTS idx_tareas_fecha ON tareas(fecha_calculada)")
@@ -100,44 +103,60 @@ def registrar_auditoria(accion, detalle):
     release_db_connection(conn)
 
 # ==========================================
-# 4. EXPORTACIÓN PROFESIONAL A EXCEL (CSV)
+# 4. EXPORTACIÓN Y RESPALDOS AUTOMÁTICOS
 # ==========================================
-async def comando_exportar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ALLOWED_USERS: return
-    m = await update.message.reply_text("⏳ Generando tu reporte de Excel/CSV...")
-
+async def generar_y_enviar_backup(context: ContextTypes.DEFAULT_TYPE):
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT id, tipo, area, concepto, monto, metodo, fecha, categoria, estado FROM finanzas ORDER BY fecha DESC")
-    finanzas = c.fetchall()
+    
+    tablas = ['finanzas', 'tareas', 'habitos']
+    archivos = []
+    
+    for tabla in tablas:
+        c.execute(f"SELECT * FROM {tabla}")
+        columnas = [desc[0] for desc in c.description]
+        datos = c.fetchall()
+        
+        path_temp = f"/tmp/backup_{tabla}.csv"
+        with open(path_temp, mode='w', encoding='utf-8-sig', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(columnas)
+            writer.writerows(datos)
+        archivos.append(path_temp)
+        
     release_db_connection(conn)
+    
+    await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="📦 *Respaldo Automático Generado:*", parse_mode='Markdown')
+    for file_path in archivos:
+        await context.bot.send_document(chat_id=MI_TELEGRAM_ID, document=open(file_path, 'rb'))
+        os.remove(file_path)
 
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv', encoding='utf-8-sig', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['ID', 'Tipo', 'Área', 'Concepto', 'Monto', 'Método', 'Fecha', 'Categoría', 'Estado'])
-        writer.writerows(finanzas)
-        path_fin = f.name
-
-    await context.bot.send_document(chat_id=MI_TELEGRAM_ID, document=open(path_fin, 'rb'), filename="Mis_Finanzas_Historico.csv", caption="📊 Aquí tienes tu base de datos financiera completa.")
-    os.remove(path_fin)
+async def comando_exportar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS: return
+    m = await update.message.reply_text("⏳ Generando tu reporte y respaldos...")
+    await generar_y_enviar_backup(context)
     await m.delete()
 
 # ==========================================
-# 5. MOTOR NLP Y LIMPIADOR EXTREMO
+# 5. MOTOR NLP EJECUTIVO (Categorías y Bancos)
 # ==========================================
-PALABRAS_EMPRESA = {'viático': 3, 'vuelo': 2, 'gasolina': 2, 'uber': 2, 'cliente': 3, 'papelería': 2, 'reporte': 2, 'empresa': 3, 'proveedor': 3}
-PALABRAS_PERSONAL = {'despensa': 3, 'luz': 3, 'agua': 3, 'internet': 3, 'cfe': 3, 'renta': 3, 'casa': 2, 'médico': 2, 'personal': 3, 'ropa': 2, 'telcel': 3}
+PALABRAS_EMPRESA = {'viático': 3, 'vuelo': 2, 'gasolina': 2, 'uber': 2, 'cliente': 3, 'papelería': 2, 'reporte': 2, 'empresa': 3, 'proveedor': 3, 'sat': 3}
+PALABRAS_PERSONAL = {'despensa': 3, 'luz': 3, 'agua': 3, 'internet': 3, 'cfe': 3, 'renta': 3, 'casa': 2, 'médico': 2, 'personal': 3, 'ropa': 2, 'telcel': 3, 'netflix': 3}
 PALABRAS_GASTO = ['pagué', 'pague', 'compré', 'compre', 'gasté', 'gaste', 'costó', 'pagar', 'ticket', 'recibo']
 PALABRAS_INGRESO = ['deposité', 'deposite', 'transferí', 'cobré', 'cobre', 'sueldo', 'pagaron', 'ingreso']
 
-# CONECTORES CONVERSACIONALES AÑADIDOS PARA LENGUAJE 100% NATURAL
-STOPWORDS = PALABRAS_GASTO + PALABRAS_INGRESO + [
-    'tengo', 'que', 'y', 'son', 'es', 'seran', 'serán', 'fue', 'fueron', 
-    'voy', 'va', 'hacer', 'me', 'le', 'se', 'lo', 'del', 'al', 
-    'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 
-    'mañana', 'hoy', 'ayer', 'pasado', 'lunes', 'martes', 'miercoles', 'miércoles', 'jueves', 'viernes', 'sabado', 'sábado', 'domingo', 
-    'en', 'para', 'de', 'a', 'por', 'con', 'pesos', 'mxn', 'este', 'esta', 'ya', 'cobro'
-]
+# MAPEO DE CATEGORÍAS REALES
+CAT_MAP = {
+    'Servicios': ['luz', 'agua', 'internet', 'cfe', 'telcel', 'renta', 'gas'],
+    'Transporte': ['uber', 'taxi', 'gasolina', 'vuelo', 'caseta', 'estacionamiento'],
+    'Alimentación': ['despensa', 'super', 'súper', 'restaurante', 'comida', 'oxxo', 'walmart', 'soriana'],
+    'Salud': ['médico', 'medico', 'farmacia', 'pastillas', 'consulta'],
+    'Entretenimiento': ['cine', 'netflix', 'spotify', 'salida']
+}
+# MAPEO DE CUENTAS BANCARIAS
+CUENTAS_MAP = ['nu', 'bbva', 'banorte', 'efectivo', 'mercado pago', 'hsbc', 'santander', 'hey']
+
+STOPWORDS = PALABRAS_GASTO + PALABRAS_INGRESO + ['tengo', 'que', 'y', 'son', 'es', 'seran', 'serán', 'fue', 'fueron', 'voy', 'va', 'hacer', 'me', 'le', 'se', 'lo', 'del', 'al', 'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'mañana', 'hoy', 'ayer', 'pasado', 'lunes', 'martes', 'miercoles', 'miércoles', 'jueves', 'viernes', 'sabado', 'sábado', 'domingo', 'en', 'para', 'de', 'a', 'por', 'con', 'pesos', 'mxn', 'este', 'esta', 'ya', 'cobro']
 
 def cargar_diccionario_aprendido():
     conn = get_db_connection()
@@ -164,30 +183,37 @@ def analizar_texto_local(texto):
     es_gasto = any(p in texto_min for p in PALABRAS_GASTO)
     es_ingreso = any(p in texto_min for p in PALABRAS_INGRESO)
     match_monto = re.search(r'\$?\s*([\d,]+(?:\.\d{1,2})?)\b(?:\s*pesos?)?', texto_min)
-    
     hoy_str = datetime.date.today().strftime('%Y-%m-%d')
     
-    # 1. EVALUAR SI ES FINANZA
+    # 1. EVALUAR FINANZAS
     if (es_gasto or es_ingreso or '$' in texto_min or 'pesos' in texto_min) and match_monto:
         tipo_finanza = "Ingreso" if es_ingreso and not es_gasto else "Gasto"
         monto = float(match_monto.group(1).replace(',', ''))
         fecha_calc = extraer_fecha(texto) or hoy_str
         estado_f = 'Pendiente' if fecha_calc > hoy_str else 'Completado'
         
-        # LIMPIEZA EXTREMA DEL CONCEPTO
-        concepto = re.sub(r'\$?\s*([\d,]+(?:\.\d{1,2})?)\b(?:\s*pesos?)?', '', texto_min, flags=re.IGNORECASE).strip()
-        concepto = re.sub(r'[^\w\s]', ' ', concepto) # Quitar comas y puntos residuales
-        
-        for w in STOPWORDS: 
-            concepto = re.sub(rf'\b{w}\b', '', concepto, flags=re.IGNORECASE)
+        # Identificar Cuenta
+        cuenta_detectada = 'Efectivo' # Default
+        for c in CUENTAS_MAP:
+            if c in texto_min: cuenta_detectada = c.capitalize(); break
             
+        # Identificar Subcategoría
+        subcat = 'General'
+        for cat, palabras in CAT_MAP.items():
+            if any(p in texto_min for p in palabras): subcat = cat; break
+        
+        # Limpieza de concepto
+        concepto = re.sub(r'\$?\s*([\d,]+(?:\.\d{1,2})?)\b(?:\s*pesos?)?', '', texto_min, flags=re.IGNORECASE).strip()
+        concepto = re.sub(r'[^\w\s]', ' ', concepto)
+        for w in STOPWORDS + CUENTAS_MAP: 
+            concepto = re.sub(rf'\b{w}\b', '', concepto, flags=re.IGNORECASE)
         concepto = re.sub(r'\s+', ' ', concepto).strip().capitalize()
         if not concepto: concepto = "Registro general"
         
         area = "Desconocida" if score_emp == 0 and score_per == 0 else ("Empresa" if score_emp > score_per else "Personal")
-        return {"tipo_registro": "finanza", "tipo": tipo_finanza, "area": area, "concepto": concepto[:40], "monto": monto, "metodo": "Efectivo", "fecha": fecha_calc, "estado": estado_f}
+        return {"tipo_registro": "finanza", "tipo": tipo_finanza, "area": area, "concepto": concepto[:40], "monto": monto, "metodo": cuenta_detectada, "fecha": fecha_calc, "estado": estado_f, "subcategoria": subcat}
     
-    # 2. EVALUAR SI ES TAREA
+    # 2. EVALUAR TAREAS
     es_recurrente = bool(re.search(r'(cada|todos los|los)\s+(lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo|d[ií]as)', texto_min)) or (sum(1 for d in ['lunes', 'martes', 'miércoles', 'miercoles', 'jueves', 'viernes', 'sábado', 'sabado', 'domingo'] if d in texto_min) >= 2)
     
     area = "Desconocida" if score_emp == 0 and score_per == 0 else ("Empresa" if score_emp > score_per else "Personal")
@@ -197,7 +223,7 @@ def analizar_texto_local(texto):
     return {"tipo_registro": "tarea", "descripcion": texto[:60].capitalize(), "tipo": area, "prioridad": prioridad, "fecha_original": texto, "fecha_calculada": fecha_calc, "notas": ""}
 
 # ==========================================
-# 6. MENÚS INTERACTIVOS Y BALANCES VISUALES
+# 6. MENÚS INTERACTIVOS Y BALANCES
 # ==========================================
 def obtener_menu_principal():
     return InlineKeyboardMarkup([
@@ -211,7 +237,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if query.from_user.id not in ALLOWED_USERS: return
     await query.answer() 
 
-    # --- MENÚ HÁBITOS ---
+    # --- HÁBITOS ---
     if query.data == 'menu_habitos':
         conn = get_db_connection()
         c = conn.cursor()
@@ -240,12 +266,10 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         msg = "Error al leer hábito."
         if res:
             racha, ultima_fecha, nombre = res
-            hoy_date = datetime.date.today()
-            hoy_str = hoy_date.strftime('%Y-%m-%d')
-            ayer_str = (hoy_date - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+            hoy_str = datetime.date.today().strftime('%Y-%m-%d')
+            ayer_str = (datetime.date.today() - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
 
-            if ultima_fecha == hoy_str:
-                msg = f"Ya completaste '{nombre}' hoy. ¡Sigue así!"
+            if ultima_fecha == hoy_str: msg = f"Ya completaste '{nombre}' hoy. ¡Sigue así!"
             else:
                 nueva_racha = racha + 1 if ultima_fecha == ayer_str else 1
                 c.execute("UPDATE habitos SET racha = %s, ultima_fecha = %s WHERE id = %s", (nueva_racha, hoy_str, h_id))
@@ -255,7 +279,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         release_db_connection(conn)
         await query.edit_message_text(f"{msg}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver a Hábitos", callback_data='menu_habitos')]]))
 
-    # --- MENÚ TAREAS ---
+    # --- TAREAS ---
     elif query.data == 'menu_tarea':
         teclado = [
             [InlineKeyboardButton("➕ Registrar manual", callback_data='tarea_nueva')],
@@ -290,7 +314,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         registrar_auditoria("COMPLETAR_TAREA", f"Se completó la tarea ID {id_tarea}")
         await query.edit_message_text("🎉 ¡Excelente! Tarea marcada como completada.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data='volver_inicio')]]))
 
-    # --- MENÚ FINANZAS ---
+    # --- FINANZAS Y BANCOS ---
     elif query.data == 'menu_finanzas':
         teclado = [
             [InlineKeyboardButton("💸 Gasto Manual", callback_data='finanza_gasto'), InlineKeyboardButton("💵 Ingreso Manual", callback_data='finanza_ingreso')],
@@ -303,7 +327,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text("💰 *Módulo Financiero:*", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(teclado))
         
     elif query.data == 'exportar_csv':
-        await query.edit_message_text("Generando reporte... Usa el comando /exportar para descargarlo.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='menu_finanzas')]]))
+        await query.edit_message_text("Generando reporte...", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='menu_finanzas')]]))
         await comando_exportar(update, context)
 
     elif query.data == 'listar_pagos_pendientes':
@@ -334,7 +358,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         conn.commit()
         release_db_connection(conn)
         registrar_auditoria("PAGO_REALIZADO", f"Se pagó la finanza ID {id_pago}")
-        await query.edit_message_text("💸 ¡Excelente! Pago marcado como realizado exitosamente el día de hoy.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data='volver_inicio')]]))
+        await query.edit_message_text("💸 ¡Excelente! Pago marcado como realizado exitosamente.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver al Menú", callback_data='volver_inicio')]]))
 
     # AGENDA DINÁMICA
     elif query.data == 'ver_calendario':
@@ -371,7 +395,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if not hay_tareas: mensaje += "Tu agenda está vacía y al día. ¡Buen trabajo!"
         await query.edit_message_text(mensaje, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]))
 
-    # BALANCES
+    # BALANCES Y ESTADÍSTICA DE CATEGORÍAS
     elif query.data.startswith('ver_balance_'):
         filtro = query.data.split('_')[2]
         conn = get_db_connection()
@@ -380,10 +404,10 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         
         if filtro == 'mes':
             mes_actual = datetime.datetime.now().strftime('%Y-%m')
-            c.execute("SELECT tipo, area, monto, concepto, fecha, estado FROM finanzas WHERE fecha LIKE %s ORDER BY fecha ASC", (f"{mes_actual}-%",))
+            c.execute("SELECT tipo, area, monto, concepto, fecha, estado, subcategoria, cuenta FROM finanzas WHERE fecha LIKE %s ORDER BY fecha ASC", (f"{mes_actual}-%",))
             titulo = f"📊 *BALANCE DEL MES ({mes_actual})*\n\n"
         else:
-            c.execute("SELECT tipo, area, monto, concepto, fecha, estado FROM finanzas ORDER BY fecha ASC")
+            c.execute("SELECT tipo, area, monto, concepto, fecha, estado, subcategoria, cuenta FROM finanzas ORDER BY fecha ASC")
             titulo = "📊 *BALANCE HISTÓRICO*\n\n"
             
         registros = c.fetchall()
@@ -392,29 +416,34 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         ing_emp = gas_emp = ing_per = gas_per = 0
         pendientes = []
         lista_gastos = []
+        gastos_por_cat = defaultdict(float)
         
         for r in registros:
-            if r[5] == 'Pendiente': pendientes.append(r)
+            r_tipo, r_area, r_monto, r_concepto, r_fecha, r_estado, r_subcat, r_cuenta = r
+            if r_estado == 'Pendiente': pendientes.append(r)
             else: 
-                if r[0] == 'Ingreso' and r[1] == 'Empresa': ing_emp += r[2]
-                elif r[0] == 'Gasto' and r[1] == 'Empresa': gas_emp += r[2]
-                elif r[0] == 'Ingreso' and r[1] == 'Personal': ing_per += r[2]
-                elif r[0] == 'Gasto' and r[1] == 'Personal': gas_per += r[2]
-                if r[0] == 'Gasto': lista_gastos.append(r)
+                if r_tipo == 'Ingreso' and r_area == 'Empresa': ing_emp += r_monto
+                elif r_tipo == 'Gasto' and r_area == 'Empresa': gas_emp += r_monto
+                elif r_tipo == 'Ingreso' and r_area == 'Personal': ing_per += r_monto
+                elif r_tipo == 'Gasto' and r_area == 'Personal': gas_per += r_monto
+                
+                if r_tipo == 'Gasto': 
+                    lista_gastos.append(r)
+                    gastos_por_cat[r_subcat] += r_monto
                 
         mensaje = titulo + f"🏢 *EMPRESA:*\n   ├ 📈 Ingreso: ${ing_emp:,.2f}\n   ├ 📉 Gasto: ${gas_emp:,.2f}\n   └ ⚖️ Balance: ${(ing_emp - gas_emp):,.2f}\n\n"
         mensaje += f"👤 *PERSONAL:*\n   ├ 📈 Ingreso: ${ing_per:,.2f}\n   ├ 📉 Gasto: ${gas_per:,.2f}\n   └ ⚖️ Balance: ${(ing_per - gas_per):,.2f}\n\n"
         
-        if lista_gastos:
-            mensaje += "📋 *Últimos Gastos Realizados:*\n"
-            for g in lista_gastos[-10:]:
-                mensaje += f"   ▫️ {g[3].title()} - 💲{g[2]:,.2f} 📅{g[4]}\n"
+        if gastos_por_cat:
+            mensaje += "🛒 *Gastos por Categoría:*\n"
+            for cat, total in sorted(gastos_por_cat.items(), key=lambda x: x[1], reverse=True):
+                mensaje += f"   ▫️ {cat}: ${total:,.2f}\n"
                 
         if pendientes:
             mensaje += "\n⏳ *PAGOS PENDIENTES (Futuros/Vencidos):*\n"
             for p in pendientes:
                 icono = "🔴" if p[4] < hoy_str else "🔸"
-                mensaje += f"   {icono} {p[3].title()} - 💲{p[2]:,.2f} 📅{p[4]}\n"
+                mensaje += f"   {icono} {p[3].title()} - 💲{p[2]:,.2f}\n"
                 
         await query.edit_message_text(mensaje, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='menu_finanzas')]]))
 
@@ -476,7 +505,7 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text("Menú Principal:", reply_markup=obtener_menu_principal())
 
 # ==========================================
-# 7. ENTRADA DE DATOS NLP Y VISUALES
+# 7. ENTRADA DE DATOS NLP, OCR Y VISUALES
 # ==========================================
 async def guardar_datos_nlp(bot, chat_id, datos):
     conn = get_db_connection()
@@ -488,8 +517,11 @@ async def guardar_datos_nlp(bot, chat_id, datos):
         
     elif datos['tipo_registro'] == 'finanza':
         estado_f = datos.get('estado', 'Completado')
-        c.execute("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha, categoria, estado) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                  (datos['tipo'], datos['area'], datos['concepto'], datos['monto'], datos['metodo'], datos['fecha'], 'General', estado_f))
+        subcat = datos.get('subcategoria', 'General')
+        cuenta = datos.get('metodo', 'Efectivo')
+        
+        c.execute("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha, categoria, estado, subcategoria, cuenta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                  (datos['tipo'], datos['area'], datos['concepto'], datos['monto'], cuenta, datos['fecha'], 'General', estado_f, subcat, cuenta))
         
         emoji_tipo = "📉 Gasto" if datos['tipo'] == 'Gasto' else "📈 Ingreso"
         emoji_estado = "⏳ Pendiente" if estado_f == 'Pendiente' else "✅ Completado"
@@ -497,7 +529,7 @@ async def guardar_datos_nlp(bot, chat_id, datos):
         mensaje = f"💳 *Registro Financiero*\n"
         mensaje += f"🏷️ *Concepto:* {datos['concepto'].title()}\n"
         mensaje += f"💲 *Monto:* ${datos['monto']:,.2f}\n"
-        mensaje += f"📊 *Categoría:* {emoji_tipo} ({datos['area']})\n"
+        mensaje += f"📊 *Cat:* {subcat} | *Cuenta:* {cuenta}\n"
         mensaje += f"📅 *Fecha:* {datos['fecha']} ({emoji_estado})"
         
     conn.commit()
@@ -510,7 +542,7 @@ async def manejar_resultado_analisis(update, context, datos):
         context.user_data['pendiente_clasificar'] = datos
         palabra = datos['concepto'] if datos['tipo_registro'] == 'finanza' else datos['descripcion']
         teclado = [[InlineKeyboardButton("🏢 Empresa", callback_data='aprender_empresa')], [InlineKeyboardButton("👤 Personal", callback_data='aprender_personal')]]
-        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"🤔 No reconozco si *'{palabra}'* es de Empresa o Personal.\n\nClasifícalo para que yo lo aprenda y la próxima vez lo haga automático:", reply_markup=InlineKeyboardMarkup(teclado), parse_mode='Markdown')
+        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"🤔 No reconozco si *'{palabra}'* es Empresa o Personal.\nClasifícalo para que yo lo aprenda:", reply_markup=InlineKeyboardMarkup(teclado), parse_mode='Markdown')
     else:
         await guardar_datos_nlp(context.bot, MI_TELEGRAM_ID, datos)
 
@@ -547,13 +579,20 @@ async def procesar_audio_local(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def procesar_foto_local(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS: return
-    m = await update.message.reply_text("📸 *Escaneando ticket...*", parse_mode='Markdown')
+    m = await update.message.reply_text("📸 *Escaneando ticket (OCR Avanzado)...*", parse_mode='Markdown')
     try:
         archivo = await context.bot.get_file(update.message.photo[-1].file_id)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_foto:
             await archivo.download_to_drive(temp_foto.name)
-            texto = pytesseract.image_to_string(Image.open(temp_foto.name), lang='spa')
-            datos = analizar_texto_local(f"ticket pagué {texto}")
+            texto_crudo = pytesseract.image_to_string(Image.open(temp_foto.name), lang='spa')
+            
+            # OCR INTELIGENTE: Buscar la palabra "TOTAL"
+            monto_detectado = ""
+            match_total = re.search(r'(?:total|importe)[\s\$:]*([\d,]+\.\d{2})', texto_crudo, re.IGNORECASE)
+            if match_total: monto_detectado = match_total.group(1)
+            
+            texto_a_analizar = f"ticket pagué {monto_detectado} {texto_crudo[:50]}"
+            datos = analizar_texto_local(texto_a_analizar)
             await manejar_resultado_analisis(update, context, datos)
             os.remove(temp_foto.name)
     except Exception:
@@ -562,7 +601,7 @@ async def procesar_foto_local(update: Update, context: ContextTypes.DEFAULT_TYPE
         await m.delete()
 
 # ==========================================
-# 8. REGISTRO MANUAL DE HÁBITOS, TAREAS Y FINANZAS
+# 8. REGISTRO MANUAL
 # ==========================================
 async def cancelar_registro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Registro cancelado.", reply_markup=obtener_menu_principal())
@@ -571,9 +610,8 @@ async def cancelar_registro(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---- HÁBITOS MANUAL ----
 async def iniciar_registro_habito(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     await u.callback_query.answer()
-    await u.callback_query.edit_message_text("🧘 *Escribe el nombre del nuevo hábito*\n(Ej. 'Ir al gimnasio', 'Leer 15 mins'):", parse_mode='Markdown')
+    await u.callback_query.edit_message_text("🧘 *Escribe el nombre del nuevo hábito*\n(Ej. 'Ir al gimnasio', 'Leer'):", parse_mode='Markdown')
     return H_NOMBRE
-
 async def capturar_habito(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     nombre = u.message.text
     conn = get_db_connection()
@@ -607,7 +645,7 @@ async def capturar_fecha(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     f_calc = dateparser.parse(u.message.text, languages=['es'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'America/Monterrey'})
     c.user_data['nueva_tarea']['fecha_original'] = u.message.text
     c.user_data['nueva_tarea']['fecha_calculada'] = f_calc.strftime('%Y-%m-%d') if f_calc else "Recurrente"
-    await u.message.reply_text("🗒️ *Notas opcionales:*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Saltar", callback_data='sin_notas')]]), parse_mode='Markdown')
+    await u.message.reply_text("🗒️ *Notas:*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Saltar", callback_data='sin_notas')]]), parse_mode='Markdown')
     return T_NOTAS
 async def capturar_notas(u: Update, cx: ContextTypes.DEFAULT_TYPE) -> int:
     tarea = cx.user_data['nueva_tarea']
@@ -643,7 +681,7 @@ async def capturar_f_monto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
         await u.message.reply_text("⚠️ Solo ingresa números:")
         return F_MONTO 
     if c.user_data['nueva_finanza']['tipo'] == "Gasto":
-        await u.message.reply_text("💳 *Método de Pago:*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Tarjeta", callback_data='f_tarjeta'), InlineKeyboardButton("Efectivo", callback_data='f_efectivo')]]), parse_mode='Markdown')
+        await u.message.reply_text("💳 *Cuenta/Método:*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Tarjeta", callback_data='f_tarjeta'), InlineKeyboardButton("Efectivo", callback_data='f_efectivo')]]), parse_mode='Markdown')
         return F_METODO
     c.user_data['nueva_finanza']['metodo'] = "N/A"
     await u.message.reply_text("📅 *Fecha:*", parse_mode='Markdown')
@@ -659,43 +697,47 @@ async def capturar_f_fecha(u: Update, cx: ContextTypes.DEFAULT_TYPE) -> int:
     ff = fc.strftime('%Y-%m-%d') if fc else datetime.datetime.now().strftime('%Y-%m-%d')
     estado = 'Pendiente' if ff > datetime.datetime.now().strftime('%Y-%m-%d') else 'Completado'
     conn = get_db_connection()
-    conn.cursor().execute("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha, categoria, estado) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)", (f['tipo'], f['area'], f['concepto'], f['monto'], f['metodo'], ff, 'General', estado))
+    conn.cursor().execute("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha, categoria, estado, subcategoria, cuenta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", (f['tipo'], f['area'], f['concepto'], f['monto'], f['metodo'], ff, 'General', estado, 'General', f['metodo']))
     conn.commit()
     release_db_connection(conn)
-    
-    emoji_tipo = "📉 Gasto" if f['tipo'] == 'Gasto' else "📈 Ingreso"
-    emoji_estado = "⏳ Pendiente" if estado == 'Pendiente' else "✅ Completado"
-    msg = f"💳 *Registro Financiero*\n🏷️ *Concepto:* {f['concepto'].title()}\n💲 *Monto:* ${f['monto']:,.2f}\n📊 *Categoría:* {emoji_tipo} ({f['area']})\n📅 *Fecha:* {ff} ({emoji_estado})"
-    await u.message.reply_text(msg, parse_mode='Markdown', reply_markup=obtener_menu_principal())
+    await u.message.reply_text("✅ *Finanza guardada*", parse_mode='Markdown', reply_markup=obtener_menu_principal())
     return ConversationHandler.END
 
 # ==========================================
-# 9. ALERTAS Y RESUMEN SEMANAL PROACTIVOS
+# 9. DASHBOARD EJECUTIVO Y ALERTAS PROACTIVAS
 # ==========================================
 async def alerta_matutina(context: ContextTypes.DEFAULT_TYPE):
-    hoy = datetime.date.today().strftime('%Y-%m-%d')
+    hoy_date = datetime.date.today()
+    hoy = hoy_date.strftime('%Y-%m-%d')
+    mes_actual = datetime.datetime.now().strftime('%Y-%m')
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT descripcion, tipo FROM tareas WHERE fecha_calculada <= %s AND estado = 'Pendiente'", (hoy,))
+    
+    c.execute("SELECT descripcion, prioridad FROM tareas WHERE fecha_calculada <= %s AND estado = 'Pendiente'", (hoy,))
     tareas_hoy = c.fetchall()
     
     c.execute("SELECT concepto, monto, fecha FROM finanzas WHERE fecha <= %s AND estado = 'Pendiente'", (hoy,))
     pagos_pendientes = c.fetchall()
+    
+    c.execute("SELECT tipo, monto FROM finanzas WHERE fecha LIKE %s AND estado = 'Completado'", (f"{mes_actual}-%",))
+    fins = c.fetchall()
     release_db_connection(conn)
 
-    mensaje = "☀️ *Buenos días.* Aquí está tu resumen de hoy:\n\n"
-    if tareas_hoy:
-        mensaje += "📝 *Tareas Pendientes:*\n"
-        for t in tareas_hoy: mensaje += f"   ▫️ {t[0]} ({t[1]})\n"
-    else: mensaje += "📝 No tienes tareas pendientes hoy.\n"
-        
+    ingresos = sum(f[1] for f in fins if f[0] == 'Ingreso')
+    gastos = sum(f[1] for f in fins if f[0] == 'Gasto')
+    urgentes = sum(1 for t in tareas_hoy if t[1] == 'Urgente')
+
+    mensaje = f"☀️ *DASHBOARD EJECUTIVO ({hoy})*\n\n"
+    mensaje += f"📅 *Tareas de hoy:* {len(tareas_hoy)} (⚠️ {urgentes} Urgentes)\n"
+    mensaje += f"⚖️ *Balance mensual:* ${(ingresos - gastos):,.2f}\n"
+    
     if pagos_pendientes:
-        mensaje += "\n⚠️ *Pagos por realizar hoy o vencidos:*\n"
+        mensaje += "\n🚨 *Pagos por realizar hoy o vencidos:*\n"
         for p in pagos_pendientes:
             icono = "🔴 VENCIDO" if p[2] < hoy else "🔔 HOY"
             mensaje += f"   {icono}: {p[0]} (${p[1]:,.2f})\n"
             
-    await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=mensaje, parse_mode='Markdown')
+    await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=mensaje, parse_mode='Markdown', reply_markup=obtener_menu_principal())
 
 async def alerta_nocturna(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="🌙 *Corte de caja.* \nMomento de revisar pendientes, completar tus hábitos de hoy y descansar.", parse_mode='Markdown', reply_markup=obtener_menu_principal())
@@ -711,7 +753,6 @@ async def alerta_semanal(context: ContextTypes.DEFAULT_TYPE):
     creadas = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM tareas WHERE fecha_completado >= %s AND fecha_completado <= %s", (hace_7_dias, hoy_str))
     completadas = c.fetchone()[0]
-
     c.execute("SELECT tipo, monto FROM finanzas WHERE fecha >= %s AND fecha <= %s AND estado = 'Completado'", (hace_7_dias, hoy_str))
     fins = c.fetchall()
     release_db_connection(conn)
@@ -721,9 +762,11 @@ async def alerta_semanal(context: ContextTypes.DEFAULT_TYPE):
 
     mensaje = f"📅 *CORTE SEMANAL AUTOMÁTICO*\n\n"
     mensaje += f"📝 *Productividad:*\n   ├ Tareas nuevas: {creadas}\n   └ ✅ Terminadas: {completadas}\n\n"
-    mensaje += f"💰 *Finanzas de los últimos 7 días:*\n   ├ 📈 Ingresos: ${ingresos:,.2f}\n   ├ 📉 Gastos: ${gastos:,.2f}\n   └ ⚖️ Balance: ${(ingresos - gastos):,.2f}\n"
+    mensaje += f"💰 *Finanzas últimos 7 días:*\n   ├ 📈 Ingresos: ${ingresos:,.2f}\n   ├ 📉 Gastos: ${gastos:,.2f}\n   └ ⚖️ Balance: ${(ingresos - gastos):,.2f}\n"
 
     await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=mensaje, parse_mode='Markdown')
+    # Auto Backup todos los domingos
+    await generar_y_enviar_backup(context)
 
 # ==========================================
 # 10. ARRANQUE DE LA APLICACIÓN
@@ -777,5 +820,5 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.PHOTO, procesar_foto_local))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_texto_libre)) 
 
-    print("🤖 Súper Bot V12 INICIADO: Limpieza de Conceptos NLP Mejorada.")
+    print("🤖 Súper Bot V13 INICIADO: Dashboard Ejecutivo, Categorías y Respaldos Automáticos.")
     app.run_polling()
