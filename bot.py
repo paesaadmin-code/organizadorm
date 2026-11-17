@@ -49,7 +49,7 @@ class ServidorFantasma(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"ok" if self.path == "/health" else b"Bot Ejecutivo V17 (Doble Saldo Fix, Resumen y Tiempos) Activo!")
+        self.wfile.write(b"ok" if self.path == "/health" else b"Bot Ejecutivo V19 (Aprendizaje Limpio y Saldos) Activo!")
 
 def iniciar_servidor():
     puerto = int(os.environ.get("PORT", 10000))
@@ -139,7 +139,7 @@ def registrar_auditoria(accion, detalle):
     ejecutar_sql("INSERT INTO historial (fecha, accion, detalle) VALUES (%s, %s, %s)", (fecha_ahora, accion, detalle))
 
 # ==========================================
-# 4. EXPORTACIÓN PROFESIONAL
+# 4. EXPORTACIÓN Y RECALCULO DE SALDOS
 # ==========================================
 async def generar_y_enviar_backup(context: ContextTypes.DEFAULT_TYPE):
     conn = get_db_connection()
@@ -168,6 +168,17 @@ async def comando_exportar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = await update.message.reply_text("⏳ Generando tu reporte y respaldos...")
     await generar_y_enviar_backup(context)
     await m.delete()
+
+async def recalcular_saldos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS: return
+    ejecutar_sql("UPDATE config_cuentas SET saldo = 0")
+    movimientos = ejecutar_sql("SELECT tipo, monto, cuenta FROM finanzas WHERE estado='Completado'", fetch_all=True) or []
+    
+    for tipo, monto, cuenta in movimientos:
+        operador = "+" if tipo == "Ingreso" else "-"
+        ejecutar_sql(f"UPDATE config_cuentas SET saldo = saldo {operador} %s WHERE LOWER(nombre) = LOWER(%s)", (monto, cuenta))
+        
+    await update.message.reply_text("✅ Saldos recalculados correctamente desde el historial de movimientos.")
 
 # ==========================================
 # 5. COMANDOS DE CONFIGURACIÓN Y PRESUPUESTOS
@@ -206,17 +217,9 @@ async def comando_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     saldo_total = sum(c[0] for c in cuentas)
     urgentes = sum(1 for t in tareas if t[1] == 'Urgente')
 
-    mensaje = f"📊 *DASHBOARD EJECUTIVO ({hoy})*\n\n"
-    mensaje += f"💰 *Saldo total:* ${saldo_total:,.2f}\n"
-    mensaje += f"📈 *Ingresos mes:* ${ing:,.2f}\n"
-    mensaje += f"📉 *Gastos mes:* ${gas:,.2f}\n"
-    mensaje += f"⚖️ *Balance mensual:* ${(ing - gas):,.2f}\n\n"
-    mensaje += f"📝 *Pendientes hoy:* {len(tareas)}\n"
-    mensaje += f"⚠️ *Urgentes:* {urgentes}\n"
+    mensaje = f"📊 *DASHBOARD EJECUTIVO ({hoy})*\n\n💰 *Saldo total:* ${saldo_total:,.2f}\n📈 *Ingresos mes:* ${ing:,.2f}\n📉 *Gastos mes:* ${gas:,.2f}\n⚖️ *Balance mensual:* ${(ing - gas):,.2f}\n\n📝 *Pendientes hoy:* {len(tareas)}\n⚠️ *Urgentes:* {urgentes}\n"
     if habito_top: mensaje += f"🔥 *Hábito top:* {habito_top[0]} ({habito_top[1]} días)\n"
-    
-    if pagos:
-        mensaje += "\n🚨 *Próximos pagos/vencidos:*\n" + "".join([f"   {'🔴' if p[2] < hoy else '🔔'} {p[0]} - ${p[1]:,.2f}\n" for p in pagos[:3]])
+    if pagos: mensaje += "\n🚨 *Próximos pagos/vencidos:*\n" + "".join([f"   {'🔴' if p[2] < hoy else '🔔'} {p[0]} - ${p[1]:,.2f}\n" for p in pagos[:3]])
             
     await update.message.reply_text(mensaje, parse_mode='Markdown', reply_markup=obtener_menu_principal())
 
@@ -224,13 +227,26 @@ async def comando_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 6. NLP, CONSULTAS INTELIGENTES Y CONTROL DE SALDOS
 # ==========================================
 PALABRAS_EMPRESA_BASE = {'viático': 3, 'vuelo': 2, 'gasolina': 2, 'uber': 2, 'cliente': 3, 'empresa': 3, 'proveedor': 3, 'sat': 3}
-PALABRAS_PERSONAL_BASE = {'despensa': 3, 'luz': 3, 'agua': 3, 'internet': 3, 'cfe': 3, 'renta': 3, 'casa': 2, 'médico': 2, 'personal': 3, 'ropa': 2}
+# PARCHE 4: CLASIFICACIÓN AUTOMÁTICA ENRIQUECIDA
+PALABRAS_PERSONAL_BASE = {
+    'despensa': 3, 'luz': 3, 'agua': 3, 'internet': 3, 'cfe': 3, 'renta': 3, 'casa': 2, 'médico': 2, 'personal': 3, 'ropa': 2,
+    'telcel': 5, 'netflix': 5, 'spotify': 5, 'walmart': 5, 'soriana': 5, 'heb': 5, 'farmacia': 5, 'amazon': 5, 'mercadolibre': 5
+}
 PALABRAS_GASTO = ['pagué', 'pague', 'compré', 'compre', 'gasté', 'gaste', 'costó', 'pagar', 'ticket', 'recibo']
 PALABRAS_INGRESO = ['deposité', 'deposite', 'transferí', 'cobré', 'cobre', 'sueldo', 'pagaron', 'ingreso']
-STOPWORDS = PALABRAS_GASTO + PALABRAS_INGRESO + ['cuanto', 'cuánto', 'que', 'qué', 'dime', 'tengo', 'que', 'y', 'son', 'es', 'fueron', 'voy', 'va', 'hacer', 'me', 'le', 'se', 'lo', 'del', 'al', 'el', 'la', 'los', 'las', 'un', 'una', 'mañana', 'hoy', 'ayer', 'pasado', 'lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado', 'domingo', 'en', 'para', 'de', 'a', 'por', 'con', 'pesos', 'mxn', 'este', 'esta', 'ya', 'cobro']
+STOPWORDS = PALABRAS_GASTO + PALABRAS_INGRESO + ['cuanto', 'cuánto', 'que', 'qué', 'dime', 'tengo', 'que', 'y', 'son', 'es', 'fueron', 'voy', 'va', 'hacer', 'me', 'le', 'se', 'lo', 'del', 'al', 'el', 'la', 'los', 'las', 'un', 'una', 'mañana', 'hoy', 'ayer', 'pasado', 'lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado', 'domingo', 'en', 'para', 'de', 'a', 'por', 'con', 'pesos', 'mxn', 'este', 'esta', 'ya', 'cobro', 'día', 'dia']
+
+# PARCHE 1: EXTRACCIÓN LIMPIA DE PALABRA DE APRENDIZAJE
+def obtener_palabra_aprendizaje(texto):
+    if not texto: return None
+    texto = texto.lower().strip()
+    palabras_invalidas = {'dia','día','hoy','ayer','mañana','pasado','pagar','pague','pagué','compre','compré','gaste','gasté','deposito','deposité','transferi','transferí','registro','general'}
+    palabras = re.findall(r'\b[a-záéíóúñ]+\b', texto)
+    palabras = [p for p in palabras if len(p) >= 3 and p not in palabras_invalidas]
+    if not palabras: return None
+    return palabras[0]
 
 def procesar_impacto_financiero(monto, tipo, cuenta_nombre, subcat, estado):
-    """Actualiza saldos reales y verifica presupuestos."""
     if estado != 'Completado': return ""
     operador = "+" if tipo == "Ingreso" else "-"
     ejecutar_sql(f"UPDATE config_cuentas SET saldo = saldo {operador} %s WHERE LOWER(nombre) = %s", (monto, cuenta_nombre.lower()))
@@ -250,56 +266,44 @@ def extraer_fecha(texto):
 
 def responder_consulta_inteligente(texto_min):
     respuesta = "🤖 *Respuesta Analítica:*\n\n"
-    año_actual = datetime.datetime.now().strftime('%Y')
-    mes_actual = datetime.datetime.now().strftime('%Y-%m')
+    año_actual, mes_actual = datetime.datetime.now().strftime('%Y'), datetime.datetime.now().strftime('%Y-%m')
+    filtro_fecha, filtro_str = "", "históricamente"
     
-    filtro_fecha = ""
-    filtro_str = "históricamente"
     if "este año" in texto_min: 
-        filtro_fecha = f"AND fecha LIKE '{año_actual}-%'"
-        filtro_str = "este año"
+        filtro_fecha, filtro_str = f"AND fecha LIKE '{año_actual}-%'", "este año"
     elif "este mes" in texto_min: 
-        filtro_fecha = f"AND fecha LIKE '{mes_actual}-%'"
-        filtro_str = "este mes"
+        filtro_fecha, filtro_str = f"AND fecha LIKE '{mes_actual}-%'", "este mes"
     
     if "dinero tengo" in texto_min or "saldo" in texto_min or "cuentas" in texto_min:
         res = ejecutar_sql("SELECT nombre, saldo FROM config_cuentas ORDER BY saldo DESC", fetch_all=True)
         total = sum(r[1] for r in res)
         respuesta += f"💰 *Saldos Actuales (Total: ${total:,.2f}):*\n" + "".join([f"▫️ {r[0]}: ${r[1]:,.2f}\n" for r in res])
-        
     elif "gastando más" in texto_min or "mayor gasto" in texto_min:
         res = ejecutar_sql(f"SELECT subcategoria, SUM(monto) as total FROM finanzas WHERE tipo='Gasto' AND estado='Completado' {filtro_fecha} GROUP BY subcategoria ORDER BY total DESC LIMIT 1", fetch_one=True)
         if res: respuesta += f"Donde más has gastado {filtro_str} es en **{res[0]}** con un total de **${res[1]:,.2f}**."
         else: respuesta += f"No has registrado gastos {filtro_str}."
-        
     elif "descuidado" in texto_min or "peor hábito" in texto_min:
         res = ejecutar_sql("SELECT nombre, racha, ultima_fecha FROM habitos ORDER BY racha ASC, ultima_fecha ASC LIMIT 1", fetch_one=True)
         if res: respuesta += f"Tu hábito más descuidado es **{res[0]}**. Racha actual: {res[1]} días."
-        
     elif "tiempo pendiente" in texto_min:
         res = ejecutar_sql("SELECT descripcion, fecha_calculada FROM tareas WHERE estado='Pendiente' AND fecha_calculada != 'Recurrente' ORDER BY fecha_calculada ASC LIMIT 1", fetch_one=True)
         if res: respuesta += f"Tu tarea pendiente más antigua es **'{res[0]}'**, programada para el {res[1]}."
-
     elif "vence" in texto_min or "pendientes" in texto_min:
         res = ejecutar_sql("SELECT concepto, monto, fecha FROM finanzas WHERE estado = 'Pendiente' ORDER BY fecha ASC", fetch_all=True)
         if not res: respuesta += "No tienes pagos pendientes programados."
         else: respuesta += "⏳ *Próximos Vencimientos:*\n" + "".join([f"▫️ {r[0]}: ${r[1]:,.2f} ({r[2]})\n" for r in res])
-            
     elif "promedio" in texto_min and "mensual" in texto_min:
         res = ejecutar_sql("SELECT AVG(mensual) FROM (SELECT SUM(monto) as mensual FROM finanzas WHERE tipo='Gasto' AND estado='Completado' GROUP BY substr(fecha, 1, 7)) as sub", fetch_one=True)
         prom = res[0] if res and res[0] else 0
         respuesta += f"Tu gasto promedio mensual histórico es de **${prom:,.2f}**."
-
     elif "tareas" in texto_min and "complet" in texto_min:
         res = ejecutar_sql(f"SELECT COUNT(*) FROM tareas WHERE estado = 'Completada' {filtro_fecha.replace('fecha', 'fecha_completado')}", fetch_one=True)
         respuesta += f"Has completado **{res[0]} tareas** {filtro_str}."
-        
     elif "gasté en" in texto_min or "gaste en" in texto_min:
         palabra_buscada = re.sub(r'(este año|este mes)', '', texto_min.split("en ")[-1]).strip().replace("?", "")
         res = ejecutar_sql(f"SELECT SUM(monto) FROM finanzas WHERE tipo = 'Gasto' AND estado = 'Completado' {filtro_fecha} AND (LOWER(concepto) LIKE %s OR LOWER(subcategoria) LIKE %s)", (f"%{palabra_buscada}%", f"%{palabra_buscada}%"), fetch_one=True)
         total = res[0] or 0
         respuesta += f"Has gastado un total de **${total:,.2f}** en '{palabra_buscada.capitalize()}' {filtro_str}."
-        
     else: return False
     return respuesta
 
@@ -320,9 +324,24 @@ def analizar_texto_local(texto):
     match_monto = re.search(r'\$?\s*([\d,]+(?:\.\d{1,2})?)\b(?:\s*pesos?)?', texto_min)
     hoy_str = datetime.date.today().strftime('%Y-%m-%d')
     
-    if (es_gasto or es_ingreso or '$' in texto_min or 'pesos' in texto_min) and match_monto:
-        monto = float(match_monto.group(1).replace(',', ''))
+    palabra_limpia = re.sub(r'\$?\s*([\d,]+(?:\.\d{1,2})?)\b(?:\s*pesos?)?', '', texto_min, flags=re.IGNORECASE).strip()
+    palabra_limpia = re.sub(r'[^\w\s]', ' ', palabra_limpia)
+    for w in STOPWORDS + CACHE_CUENTAS: palabra_limpia = re.sub(rf'\b{w}\b', '', palabra_limpia, flags=re.IGNORECASE)
+    palabra_limpia = re.sub(r'\s+', ' ', palabra_limpia).strip().capitalize()
+    if not palabra_limpia: palabra_limpia = "Registro general"
+    
+    area = "Desconocida" if score_emp == 0 and score_per == 0 else ("Empresa" if score_emp > score_per else "Personal")
+    
+    # === BONUS V19: SI ES GASTO/INGRESO PERO NO HAY MONTO (Ej. "Pagar telcel mañana") ===
+    tiene_intencion_financiera = (es_gasto or es_ingreso or '$' in texto_min or 'pesos' in texto_min)
+    
+    if tiene_intencion_financiera:
+        tipo_finanza = "Ingreso" if es_ingreso and not es_gasto else "Gasto"
+        monto = float(match_monto.group(1).replace(',', '')) if match_monto else 0.0
         fecha_calc = extraer_fecha(texto) or hoy_str
+        
+        # Si no tiene monto, lo forzamos a 'Pendiente' para que sea un recordatorio
+        estado_f = 'Pendiente' if (fecha_calc > hoy_str or monto == 0.0) else 'Completado'
         
         cuenta_detectada = 'Efectivo'
         for c in CACHE_CUENTAS:
@@ -332,25 +351,18 @@ def analizar_texto_local(texto):
         for c_key, c_orig in CACHE_CATEGORIAS.items():
             if c_key in texto_min: subcat = c_orig; break
         
-        concepto = re.sub(r'\$?\s*([\d,]+(?:\.\d{1,2})?)\b(?:\s*pesos?)?', '', texto_min, flags=re.IGNORECASE).strip()
-        concepto = re.sub(r'[^\w\s]', ' ', concepto)
-        for w in STOPWORDS + CACHE_CUENTAS + list(CACHE_CATEGORIAS.keys()): 
-            concepto = re.sub(rf'\b{w}\b', '', concepto, flags=re.IGNORECASE)
-        concepto = re.sub(r'\s+', ' ', concepto).strip().capitalize() or "Registro general"
-        
         return {
-            "tipo_registro": "finanza", "tipo": "Ingreso" if es_ingreso and not es_gasto else "Gasto", 
-            "area": "Desconocida" if score_emp == 0 and score_per == 0 else ("Empresa" if score_emp > score_per else "Personal"), 
-            "concepto": concepto[:40], "monto": monto, "metodo": cuenta_detectada, 
-            "fecha": fecha_calc, "estado": 'Pendiente' if fecha_calc > hoy_str else 'Completado', "subcategoria": subcat
+            "tipo_registro": "finanza", "tipo": tipo_finanza, 
+            "area": area, "concepto": palabra_limpia[:40], "monto": monto, "metodo": cuenta_detectada, 
+            "fecha": fecha_calc, "estado": estado_f, "subcategoria": subcat, "palabra_clave": palabra_limpia
         }
     
     es_rec = bool(re.search(r'(cada|todos los|los)\s+(lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo|d[ií]as)', texto_min)) or (sum(1 for d in ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo'] if d in texto_min) >= 2)
     return {
         "tipo_registro": "tarea", "descripcion": texto[:60].capitalize(), 
-        "tipo": "Desconocida" if score_emp == 0 and score_per == 0 else ("Empresa" if score_emp > score_per else "Personal"), 
-        "prioridad": "Urgente" if "urgente" in texto_min else "Rutina", 
-        "fecha_original": texto, "fecha_calculada": "Recurrente" if es_rec else (extraer_fecha(texto) or "Recurrente"), "notas": ""
+        "tipo": area, "prioridad": "Urgente" if "urgente" in texto_min else "Rutina", 
+        "fecha_original": texto, "fecha_calculada": "Recurrente" if es_rec else (extraer_fecha(texto) or "Recurrente"), 
+        "notas": "", "palabra_clave": palabra_limpia
     }
 
 # ==========================================
@@ -438,7 +450,6 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif query.data.startswith('pagar_f_'):
         id_pago = query.data.split('_')[2]
-        # PROTECCIÓN DOBLE SALDO: Solo procesar si realmente estaba pendiente
         info = ejecutar_sql("SELECT monto, tipo, cuenta, subcategoria, estado FROM finanzas WHERE id = %s", (id_pago,), fetch_one=True)
         if info and info[4] == 'Pendiente':
             ejecutar_sql("UPDATE finanzas SET estado = 'Completado', fecha = %s WHERE id = %s", (datetime.date.today().strftime('%Y-%m-%d'), id_pago))
@@ -509,8 +520,8 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         categoria = "Empresa" if query.data == 'aprender_empresa' else "Personal"
         datos = context.user_data.get('pendiente_clasificar')
         if datos:
-            palabra = datos['concepto'] if datos['tipo_registro'] == 'finanza' else datos['descripcion']
-            ejecutar_sql("INSERT INTO diccionario (palabra, categoria) VALUES (%s, %s) ON CONFLICT DO NOTHING", (palabra, categoria))
+            palabra = datos.get('palabra_clave') or datos.get('concepto') or datos.get('descripcion')
+            ejecutar_sql("INSERT INTO diccionario (palabra, categoria) VALUES (%s, %s) ON CONFLICT DO NOTHING", (palabra.lower(), categoria))
             recargar_cache()
             
             datos['area' if datos['tipo_registro'] == 'finanza' else 'tipo'] = categoria
@@ -580,9 +591,19 @@ async def manejar_resultado_analisis(update, context, datos):
     area = datos.get('area') or datos.get('tipo')
     if area == "Desconocida":
         context.user_data['pendiente_clasificar'] = datos
-        palabra = datos.get('concepto') or datos.get('descripcion')
+        
+        # PARCHE 2: APRENDIZAJE LIMPIO
+        texto_aprender = datos.get('palabra_clave') or datos.get('concepto') or datos.get('descripcion')
+        palabra = obtener_palabra_aprendizaje(texto_aprender)
+        
+        if not palabra:
+            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="⚠️ No encontré una palabra útil para aprendizaje automático. Lo guardaré por defecto.")
+            datos['area' if datos['tipo_registro'] == 'finanza' else 'tipo'] = 'Personal'
+            await guardar_datos_nlp(context.bot, MI_TELEGRAM_ID, datos)
+            return
+
         teclado = [[InlineKeyboardButton("🏢 Empresa", callback_data='aprender_empresa')], [InlineKeyboardButton("👤 Personal", callback_data='aprender_personal')]]
-        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"🤔 No reconozco si *'{palabra}'* es Empresa o Personal.\nClasifícalo para aprenderlo:", reply_markup=InlineKeyboardMarkup(teclado), parse_mode='Markdown')
+        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"🤔 No reconozco si *'{palabra.capitalize()}'* es Empresa o Personal.\nClasifícalo para aprenderlo:", reply_markup=InlineKeyboardMarkup(teclado), parse_mode='Markdown')
     else:
         await guardar_datos_nlp(context.bot, MI_TELEGRAM_ID, datos)
 
@@ -729,8 +750,39 @@ async def capturar_f_fecha(u: Update, cx: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 # ==========================================
-# 10. ARRANQUE
+# 10. ARRANQUE Y ALARMAS
 # ==========================================
+async def alerta_matutina(context: ContextTypes.DEFAULT_TYPE):
+    hoy = datetime.date.today().strftime('%Y-%m-%d')
+    tareas = ejecutar_sql("SELECT descripcion, prioridad FROM tareas WHERE fecha_calculada <= %s AND estado = 'Pendiente'", (hoy,), fetch_all=True) or []
+    pagos = ejecutar_sql("SELECT concepto, monto, fecha FROM finanzas WHERE fecha <= %s AND estado = 'Pendiente'", (hoy,), fetch_all=True) or []
+    fins = ejecutar_sql("SELECT tipo, monto FROM finanzas WHERE fecha LIKE %s AND estado = 'Completado'", (f"{datetime.datetime.now().strftime('%Y-%m')}-%",), fetch_all=True) or []
+
+    ing = sum(f[1] for f in fins if f[0] == 'Ingreso')
+    gas = sum(f[1] for f in fins if f[0] == 'Gasto')
+    urgentes = sum(1 for t in tareas if t[1] == 'Urgente')
+
+    mensaje = f"☀️ *DASHBOARD ({hoy})*\n\n📅 *Tareas hoy:* {len(tareas)} (⚠️ {urgentes} Urgentes)\n⚖️ *Balance mensual:* ${(ing - gas):,.2f}\n"
+    if pagos:
+        mensaje += "\n🚨 *Vencimientos de hoy:*\n" + "".join([f"   {'🔴' if p[2] < hoy else '🔔'} {p[0]} (${p[1]:,.2f})\n" for p in pagos])
+    await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=mensaje, parse_mode='Markdown', reply_markup=obtener_menu_principal())
+
+async def alerta_nocturna(context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="🌙 *Corte de caja.* Completa tus hábitos y descansa.", parse_mode='Markdown', reply_markup=obtener_menu_principal())
+
+async def alerta_semanal(context: ContextTypes.DEFAULT_TYPE):
+    hace_7, hoy_str = (datetime.date.today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d'), datetime.date.today().strftime('%Y-%m-%d')
+    creadas = (ejecutar_sql("SELECT COUNT(*) FROM tareas WHERE fecha_calculada BETWEEN %s AND %s", (hace_7, hoy_str), fetch_one=True) or [0])[0]
+    comp = (ejecutar_sql("SELECT COUNT(*) FROM tareas WHERE fecha_completado BETWEEN %s AND %s", (hace_7, hoy_str), fetch_one=True) or [0])[0]
+    fins = ejecutar_sql("SELECT tipo, monto FROM finanzas WHERE fecha BETWEEN %s AND %s AND estado = 'Completado'", (hace_7, hoy_str), fetch_all=True) or []
+
+    ing = sum(f[1] for f in fins if f[0] == 'Ingreso')
+    gas = sum(f[1] for f in fins if f[0] == 'Gasto')
+
+    mensaje = f"📅 *CORTE SEMANAL*\n\n📝 *Productividad:*\n   ├ Nuevas: {creadas}\n   └ ✅ Terminadas: {comp}\n\n💰 *Finanzas:*\n   ├ 📈 In: ${ing:,.2f} | 📉 Out: ${gas:,.2f}\n   └ ⚖️ Balance: ${(ing - gas):,.2f}\n"
+    await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=mensaje, parse_mode='Markdown')
+    await generar_y_enviar_backup(context)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_user.id not in ALLOWED_USERS: return
     await update.message.reply_text("¡Hola! Háblame o usa el menú:", reply_markup=obtener_menu_principal())
@@ -748,6 +800,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("add_cuenta", add_cuenta))
     app.add_handler(CommandHandler("presupuesto", set_presupuesto))
     app.add_handler(CommandHandler("resumen", comando_resumen))
+    app.add_handler(CommandHandler("recalcular_saldos", recalcular_saldos)) # PARCHE 3
 
     conv_handler_tarea = ConversationHandler(
         entry_points=[CallbackQueryHandler(iniciar_registro_tarea, pattern='^tarea_nueva$')],
@@ -776,5 +829,5 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.PHOTO, procesar_foto_local))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_texto_libre)) 
 
-    print("🤖 Súper Bot V17 INICIADO: Resumen Ejecutivo, Consultas Temporales y Bloqueo de Saldos.")
+    print("🤖 Súper Bot V19 INICIADO: Aprendizaje Seguro, Saldos y NLP Predictivo.")
     app.run_polling()
