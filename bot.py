@@ -467,6 +467,56 @@ async def procesar_foto_local(update: Update, context: ContextTypes.DEFAULT_TYPE
 # 7. EDICIÓN INTERACTIVA (WHITELIST Y DATEPARSER)
 # ==========================================
 async def iniciar_edicion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if query.data == 'editar_registros':
+    fins = ejecutar_sql(
+        """
+        SELECT id, concepto, monto
+        FROM finanzas
+        ORDER BY id DESC
+        LIMIT 3
+        """,
+        fetch_all=True
+    ) or []
+    tars = ejecutar_sql(
+        """
+        SELECT id, descripcion, fecha_calculada
+        FROM tareas
+        ORDER BY id DESC
+        LIMIT 3
+        """,
+        fetch_all=True
+    ) or []
+    teclado = [
+        [
+            InlineKeyboardButton(
+                f"💸 {f[1][:15]} (${f[2]:.0f})",
+                callback_data=f"edit_f_{f[0]}"
+            )
+        ]
+        for f in fins
+    ]
+    teclado.extend([
+        [
+            InlineKeyboardButton(
+                f"📝 {t[1][:15]}",
+                callback_data=f"edit_t_{t[0]}"
+            )
+        ]
+        for t in tars
+    ])
+    teclado.append(
+        [
+            InlineKeyboardButton(
+                "🔙 Volver",
+                callback_data="volver_inicio"
+            )
+        ]
+    )
+    await query.edit_message_text(
+        "Selecciona el registro a editar:",
+        reply_markup=InlineKeyboardMarkup(teclado)
+    )
+    return ConversationHandler.END
     if update.effective_user.id not in ALLOWED_USERS: return
     query = update.callback_query
     await query.answer()
