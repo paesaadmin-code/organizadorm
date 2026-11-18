@@ -265,6 +265,19 @@ def responder_consulta_inteligente(texto_min):
         res = ejecutar_sql(f"SELECT SUM(monto) FROM finanzas WHERE tipo = 'Gasto' AND estado = 'Completado' AND es_recordatorio = FALSE {f_fecha} AND (LOWER(concepto) LIKE %s OR LOWER(subcategoria) LIKE %s)", (f"%{palabra}%", f"%{palabra}%"), fetch_one=True)
         return resp + f"Has gastado **${(res[0] or 0):,.2f}** en '{palabra.capitalize()}' {f_str}."
     return False
+    if not res:
+
+    registrar_error(
+        "INSERT",
+        "No se obtuvo ID de retorno"
+    )
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text="⚠️ No se pudo guardar el registro."
+    )
+
+    return
 
 def analizar_texto_local(texto):
     texto_upper, texto_min = texto.upper(), texto.lower()
@@ -384,6 +397,19 @@ async def guardar_datos_nlp(bot, chat_id, datos, context=None):
     if datos['tipo_registro'] == 'tarea':
         res = ejecutar_sql("INSERT INTO tareas (descripcion, tipo, prioridad, fecha_original, fecha_calculada, categoria_operativa) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
                   (datos['descripcion'], datos['tipo'], datos['prioridad'], datos['fecha_original'], datos['fecha_calculada'], datos['categoria_operativa']), fetch_one=True)
+        if not res:
+
+    registrar_error(
+        "INSERT",
+        "No se obtuvo ID de retorno"
+    )
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text="⚠️ No se pudo guardar el registro."
+    )
+
+    return
         if res: registrar_operacion('tareas', res[0], 'INSERT')
         msg = MSG_EXITO_TAREA.format(cat_op=datos['categoria_operativa'], desc=datos['descripcion'], fecha=datos['fecha_calculada'], area=datos['tipo'])
         
@@ -391,6 +417,19 @@ async def guardar_datos_nlp(bot, chat_id, datos, context=None):
         est, subcat, cta, es_rec = datos.get('estado', 'Completado'), datos.get('subcategoria', 'General'), datos.get('metodo', 'Efectivo'), datos.get('es_recordatorio', False)
         res = ejecutar_sql("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha, categoria, estado, subcategoria, cuenta, es_recordatorio) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
                   (datos['tipo'], datos['area'], datos['concepto'], datos['monto'], cta, datos['fecha'], 'General', est, subcat, cta, es_rec), fetch_one=True)
+if not res:
+
+    registrar_error(
+        "INSERT",
+        "No se obtuvo ID de retorno"
+    )
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text="⚠️ No se pudo guardar el registro."
+    )
+
+    return
         if res: registrar_operacion('finanzas', res[0], 'INSERT')
         
         alerta = procesar_impacto_financiero(datos['monto'], datos['tipo'], cta, subcat, est)
@@ -742,10 +781,33 @@ async def capturar_notas(u: Update, cx: ContextTypes.DEFAULT_TYPE) -> int:
     cat_op = "RUTINA" if tarea['prioridad'] == "Rutina" else "TAREA"
     res = ejecutar_sql("INSERT INTO tareas (descripcion, tipo, prioridad, fecha_original, fecha_calculada, notas, estado, categoria_operativa) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
               (tarea['descripcion'], tarea['tipo'], tarea['prioridad'], tarea['fecha_original'], tarea['fecha_calculada'], "Ninguna" if u.callback_query else u.message.text, 'Pendiente', cat_op), fetch_one=True)
+if not res:
+
+    registrar_error(
+        "INSERT",
+        "No se obtuvo ID de retorno"
+    )
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text="⚠️ No se pudo guardar el registro."
+    )
+
+    return
     if res: registrar_operacion('tareas', res[0], 'INSERT')
     msg = MSG_EXITO_TAREA.format(cat_op=cat_op, desc=tarea['descripcion'], fecha=tarea['fecha_calculada'], area=tarea['tipo'])
     await (u.callback_query.edit_message_text if u.callback_query else u.message.reply_text)(msg, parse_mode='Markdown', reply_markup=obtener_menu_principal())
     return ConversationHandler.END
+    if not res:
+    registrar_error(
+        "INSERT",
+        "No se obtuvo ID de retorno"
+    )
+    await bot.send_message(
+        chat_id=chat_id,
+        text="⚠️ No se pudo guardar el registro."
+    )
+    return
 
 async def iniciar_finanzas(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     await u.callback_query.answer()
@@ -786,11 +848,34 @@ async def capturar_f_fecha(u: Update, cx: ContextTypes.DEFAULT_TYPE) -> int:
     est = 'Pendiente' if ff > datetime.datetime.now().strftime('%Y-%m-%d') else 'Completado'
     res = ejecutar_sql("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha, categoria, estado, subcategoria, cuenta, es_recordatorio) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id", 
                 (f['tipo'], f['area'], f['concepto'], f['monto'], f['metodo'], ff, 'General', est, 'General', f['metodo'], False), fetch_one=True)
+if not res:
+
+    registrar_error(
+        "INSERT",
+        "No se obtuvo ID de retorno"
+    )
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text="⚠️ No se pudo guardar el registro."
+    )
+
+    return
     if res: registrar_operacion('finanzas', res[0], 'INSERT')
     alerta = procesar_impacto_financiero(f['monto'], f['tipo'], f['metodo'], 'General', est)
     msg = MSG_EXITO_FINANZA.format(concepto=f['concepto'].title(), monto=f['monto'], cat="General", cuenta=f['metodo'], fecha=ff, estado="⏳ Pendiente" if est == 'Pendiente' else "✅ Completado", alerta=alerta)
     await u.message.reply_text(msg, parse_mode='Markdown', reply_markup=obtener_menu_principal())
     return ConversationHandler.END
+    if not res:
+    registrar_error(
+        "INSERT",
+        "No se obtuvo ID de retorno"
+    )
+    await bot.send_message(
+        chat_id=chat_id,
+        text="⚠️ No se pudo guardar el registro."
+    )
+    return
 
 async def alerta_matutina(context: ContextTypes.DEFAULT_TYPE):
     hoy = datetime.date.today().strftime('%Y-%m-%d')
