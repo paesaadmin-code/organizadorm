@@ -792,11 +792,13 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("presupuesto", set_presupuesto))
     app.add_handler(CommandHandler("recalcular_saldos", recalcular_saldos))
     
-    conv_edicion = ConversationHandler(
-        entry_points=[CallbackQueryHandler(iniciar_edicion, pattern='^edit_')],
-        states={E_CAMPO: [CallbackQueryHandler(capturar_campo_edicion, pattern='^edcampo_')], E_VALOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, guardar_edicion)]},
-        fallbacks=[CommandHandler('cancelar', lambda u, c: ConversationHandler.END)]
-    )
+conv_edicion = ConversationHandler(
+    entry_points=[
+        CallbackQueryHandler(
+            iniciar_edicion,
+            pattern='^editar_registros$|^edit_f_|^edit_t_'
+        )
+    ],
     
     conv_handler_tarea = ConversationHandler(
         entry_points=[CallbackQueryHandler(iniciar_registro_tarea, pattern='^tarea_nueva$')],
