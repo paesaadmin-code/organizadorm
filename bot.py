@@ -314,6 +314,64 @@ def analizar_texto_local(texto):
 # ==========================================
 # 6. ENTRADA Y FLUJO DE DATOS
 # ==========================================
+async def recalcular_saldos(update, context):
+    if update.effective_user.id not in ALLOWED_USERS:
+        return
+    sincronizar_saldos_db()
+    await update.message.reply_text(
+        "✅ Saldos reconstruidos correctamente."
+    )
+
+async def add_cuenta(update, context):
+    if update.effective_user.id not in ALLOWED_USERS:
+        return
+    nombre = " ".join(context.args)
+    if not nombre:
+        return await update.message.reply_text(
+            "Uso: /add_cuenta NombreCuenta"
+        )
+    ejecutar_sql(
+        """
+        INSERT INTO config_cuentas
+        (nombre,saldo)
+        VALUES (%s,0)
+        ON CONFLICT DO NOTHING
+        """,
+        (nombre,)
+    )
+    recargar_cache()
+    await update.message.reply_text(
+        f"✅ Cuenta '{nombre}' agregada."
+    )
+
+
+async def set_presupuesto(update, context):
+    if update.effective_user.id not in ALLOWED_USERS:
+        return
+    try:
+        categoria = context.args[0]
+        limite = float(context.args[1])
+        ejecutar_sql(
+            """
+            INSERT INTO presupuestos
+            (categoria, limite)
+            VALUES (%s,%s)
+            ON CONFLICT (categoria)
+            DO UPDATE SET limite = EXCLUDED.limite
+            """,
+            (
+                categoria.capitalize(),
+                limite
+            )
+        )
+        await update.message.reply_text(
+            f"✅ Presupuesto actualizado para {categoria}."
+        )
+    except Exception:
+        await update.message.reply_text(
+            "Uso: /presupuesto Comida 5000"
+        )
+
 async def guardar_datos_nlp(bot, chat_id, datos, context=None):
     if datos.get('tipo_registro') == 'consulta':
         return await bot.send_message(chat_id=chat_id, text=datos['respuesta'], parse_mode='Markdown')
