@@ -817,6 +817,3 @@ if __name__ == '__main__':
 
     print("🤖 Súper Bot V28 INICIADO: Full Producción con Correcciones Finales Aplicadas.")
     app.run_polling()
-
-
-puedes revisar si hay errores de sintaxis, de que falten funciones o algo porque no funciona correctamente todo el codigo en telegram
