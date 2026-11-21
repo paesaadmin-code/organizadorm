@@ -473,6 +473,10 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id not in ALLOWED_USERS: return
     await query.answer() 
+    
+    elif query.data == 'exportar_csv':
+    await query.edit_message_text("⏳ Generando reporte...")
+    await generar_y_enviar_backup(context)
 
     if query.data == 'confirmar_alto':
         datos = context.user_data.pop('pending_alta', None)
@@ -714,6 +718,27 @@ async def alerta_semanal(context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 # COMANDOS DE CONFIGURACIÓN Y PRESUPUESTOS
 # ==========================================
+async def add_cuenta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS: return
+    nombre = " ".join(context.args)
+    if nombre:
+        ejecutar_sql("INSERT INTO config_cuentas (nombre) VALUES (%s) ON CONFLICT DO NOTHING", (nombre,))
+        recargar_cache()
+        await update.message.reply_text(f"✅ Cuenta '{nombre}' agregada al sistema.")
+
+async def set_presupuesto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS: return
+    try:
+        categoria, limite = context.args[0], float(context.args[1])
+        ejecutar_sql("INSERT INTO presupuestos (categoria, limite) VALUES (%s, %s) ON CONFLICT (categoria) DO UPDATE SET limite = EXCLUDED.limite", (categoria.capitalize(), limite))
+        await update.message.reply_text(f"✅ Presupuesto de ${limite} establecido para '{categoria}'.")
+    except:
+        await update.message.reply_text("⚠️ Uso incorrecto. Escribe: /presupuesto Comida 5000")
+
+async def recalcular_saldos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS: return
+    sincronizar_saldos_db()
+    await update.message.reply_text("✅ Saldos sincronizados desde el historial.")
 
 async def add_cuenta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS: return
@@ -761,6 +786,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("add_cuenta", add_cuenta))
     app.add_handler(CommandHandler("presupuesto", set_presupuesto))
     app.add_handler(CommandHandler("recalcular_saldos", recalcular_saldos))
+    app.add_handler(CommandHandler("exportar", comando_exportar))
     
     conv_edicion = ConversationHandler(
         entry_points=[CallbackQueryHandler(iniciar_edicion, pattern='^edit_')],
