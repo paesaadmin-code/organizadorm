@@ -507,6 +507,12 @@ async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await guardar_datos_nlp(context.bot, MI_TELEGRAM_ID, datos, context)
             await query.edit_message_text("✅ Monto alto confirmado.")
 
+    elif query.data.startswith('borrar_f_'):
+    id_borrar = query.data.split('_')[2]
+    ejecutar_sql("DELETE FROM finanzas WHERE id = %s", (id_borrar,))
+    sincronizar_saldos_db() # Recalculates balances after deletion
+    await query.edit_message_text(f"✅ Record #{id_borrar} successfully deleted.", reply_markup=obtener_menu_principal())
+
     elif query.data == 'editar_registros':
         fins = ejecutar_sql("SELECT id, concepto, monto FROM finanzas ORDER BY id DESC LIMIT 3", fetch_all=True) or []
         tars = ejecutar_sql("SELECT id, descripcion, fecha_calculada FROM tareas ORDER BY id DESC LIMIT 3", fetch_all=True) or []
@@ -745,6 +751,7 @@ if __name__ == '__main__':
     init_db_pool()
     init_db()
     
+ejecutar_sql("CREATE TABLE IF NOT EXISTS historial_habitos (id SERIAL PRIMARY KEY, habito_id INTEGER, fecha TEXT)")
     threading.Thread(target=iniciar_servidor, daemon=True).start()
     app = ApplicationBuilder().token(TOKEN).build()
 
