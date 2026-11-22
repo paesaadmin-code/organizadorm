@@ -1,10 +1,8 @@
-python-telegram-bot
-python-telegram-bot[job-queue]
-dateparser
-psycopg2-binary
-SpeechRecognition
-pydub
-pytesseract
-Pillow
+python-telegram-bot[job-queue]==20.7
+psycopg2-binary==2.9.9
+dateparser==1.2.0
+SpeechRecognition==3.10.0
+pydub==0.25.1
+pytesseract==0.3.10
+Pillow==10.1.0
 spacy==3.7.2
-es-core-news-md @ https://github.com/explosion/spacy-models/releases/download/es_core_news_md-3.7.0/es_core_news_md-3.7.0-py3-none-any.whl

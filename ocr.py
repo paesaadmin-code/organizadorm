@@ -1,0 +1,1 @@
+# OCR functions using pytesseract
