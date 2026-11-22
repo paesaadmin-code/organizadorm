@@ -7,7 +7,6 @@ import csv
 from zoneinfo import ZoneInfo
 import tempfile
 import threading
-from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import psycopg2
@@ -18,71 +17,71 @@ import speech_recognition as sr
 from pydub import AudioSegment
 import pytesseract
 from PIL import Image
-
+from collections import defaultdict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler, 
-    MessageHandler, filters, ContextTypes, ConversationHandler
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 import spacy
 try:
-    nlp_spacy = spacy.load("es_core_news_md")
+    nlp_spacy = spacy.load("en_core_web_md")
 except Exception as e:
-    logging.warning(f"No spaCy: {e}. Se usará NLP heurístico de respaldo.")
+    logging.warning(f"No spaCy: {e}. Fallback heuristic NLP will be used.")
     nlp_spacy = None
 
 # ==========================================
-# 1. CONFIGURACIÓN Y MENSAJES
+# 1. CONFIGURATION, SECURITY & MESSAGES
 # ==========================================
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-MI_TELEGRAM_ID = int(os.getenv("TELEGRAM_ID", 0))
-ALLOWED_USERS = [MI_TELEGRAM_ID]
+MY_TELEGRAM_ID = int(os.getenv("TELEGRAM_ID", 0))
+ALLOWED_USERS = [MY_TELEGRAM_ID]
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# ESTADOS CONVERSACIONALES
-T_DESCRIPCION, T_TIPO, T_PRIORIDAD, T_FECHA, T_NOTAS = range(5)
-F_AREA, F_CONCEPTO, F_MONTO, F_METODO, F_FECHA = range(5, 10)
-E_CAMPO, E_VALOR = range(10, 12)
-H_NOMBRE = 12
-S_CONCEPTO, S_MONTO, S_FECHA = range(13, 16)
+T_DESCRIPTION, T_TYPE, T_PRIORITY, T_DATE, T_NOTES = range(5)
+F_AREA, F_CONCEPT, F_AMOUNT, F_METHOD, F_DATE = range(5, 10)
+E_FIELD, E_VALUE = range(10, 12)
+H_NAME = 12
+S_CONCEPT, S_AMOUNT, S_DATE = range(13, 16)
 
-MSG_EXITO_TAREA = "✅ *{cat_op} Registrada*\n📌 {desc}\n⏰ Fecha: {fecha}\n📂 Área: {area}"
-MSG_EXITO_FINANZA = "💳 *Registro Financiero*\n🏷️ {concepto}\n💲 ${monto:,.2f}\n📊 Cat: {cat} | Cuenta: {cuenta}\n📅 Fecha: {fecha} ({estado}){alerta}"
-MSG_ERROR = "⚠️ Hubo un error. Intenta con texto o usa el menú manual."
-MSG_AUDIO_LARGO = "⚠️ El audio es muy largo. Máximo 60 segundos por límite de memoria."
+MSG_SUCCESS_TASK = "✅ *{cat_op} Registered*\n📌 {desc}\n⏰ Date: {date}\n📂 Area: {area}"
+MSG_SUCCESS_FINANCE = "💳 *Financial Record*\n🏷️ {concept}\n💲 ${amount:,.2f}\n📊 Cat: {cat} | Account: {account}\n📅 Date: {date} ({status}){alert}"
+MSG_ERROR = "⚠️ An error occurred. Try sending text or use the manual menu."
+MSG_AUDIO_LONG = "⚠️ Audio is too long. Maximum 60 seconds due to memory limits."
 
 # ==========================================
-# 2. SERVIDOR FANTASMA
+# 2. GHOST SERVER (HEALTH CHECK)
 # ==========================================
-class ServidorFantasma(BaseHTTPRequestHandler):
+class GhostServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"ok" if self.path == "/health" else b"Bot Ejecutivo V28 Completo Activo!")
+        self.wfile.write(b"ok" if self.path == "/health" else b"Executive Bot V28 (Ultimate Merged) Active!")
 
-def iniciar_servidor():
-    HTTPServer(('0.0.0.0', int(os.environ.get("PORT", 10000))), ServidorFantasma).serve_forever()
+def start_server():
+    port = int(os.environ.get("PORT", 10000))
+    HTTPServer(('0.0.0.0', port), GhostServer).serve_forever()
 
 # ==========================================
-# 3. BASE DE DATOS Y PERSISTENCIA
+# 3. DATABASE & PERSISTENCE
 # ==========================================
 db_pool = None
-CACHE_DICCIONARIO, CACHE_CUENTAS, CACHE_CATEGORIAS = {'EMPRESA': {}, 'PERSONAL': {}}, {}, {}
+CACHE_DICTIONARY = {'BUSINESS': {}, 'PERSONAL': {}}
+CACHE_ACCOUNTS = {}
+CACHE_CATEGORIES = {}
 
 def init_db_pool():
     global db_pool
-    if DATABASE_URL: 
-        db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
+    if DATABASE_URL: db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
 
 def get_db_connection():
     return db_pool.getconn()
 
-def ejecutar_sql(query, params=None, fetch_all=False, fetch_one=False, commit=True):
+def execute_sql(query, params=None, fetch_all=False, fetch_one=False, commit=True):
     if not db_pool: return None
-    conn, c, res = db_pool.getconn(), None, None
+    conn = db_pool.getconn()
+    res, c = None, None
     try:
         c = conn.cursor()
         c.execute(query, params or ())
@@ -98,891 +97,940 @@ def ejecutar_sql(query, params=None, fetch_all=False, fetch_one=False, commit=Tr
     return res
 
 def init_db():
-    tablas = [
-        "tareas (id SERIAL PRIMARY KEY, descripcion TEXT, tipo TEXT, prioridad TEXT, fecha_original TEXT, fecha_calculada TEXT, notas TEXT, estado TEXT DEFAULT 'Pendiente', fecha_completado TEXT, categoria_operativa TEXT DEFAULT 'TAREA')",
-        "finanzas (id SERIAL PRIMARY KEY, tipo TEXT, area TEXT, concepto TEXT, monto REAL, metodo TEXT, fecha TEXT, categoria TEXT DEFAULT 'General', subcategoria TEXT DEFAULT 'General', cuenta TEXT DEFAULT 'Efectivo', estado TEXT DEFAULT 'Completado', es_recordatorio BOOLEAN DEFAULT FALSE)",
-        "diccionario (palabra TEXT PRIMARY KEY, categoria TEXT)",
-        "historial_operaciones (id SERIAL PRIMARY KEY, tabla TEXT, registro_id INTEGER, accion TEXT, fecha TEXT)",
-        "config_cuentas (nombre TEXT PRIMARY KEY, saldo REAL DEFAULT 0)",
-        "config_categorias (nombre TEXT PRIMARY KEY, tipo TEXT, palabras_clave TEXT DEFAULT '')",
-        "presupuestos (categoria TEXT PRIMARY KEY, limite REAL)",
-        "errores (id SERIAL PRIMARY KEY, fecha TEXT, modulo TEXT, error TEXT)",
-        "habitos (id SERIAL PRIMARY KEY, nombre TEXT, racha INTEGER DEFAULT 0, ultima_fecha TEXT)",
-        "historial_habitos (id SERIAL PRIMARY KEY, habito_id INTEGER, fecha TEXT)"
+    tables = [
+        "tasks (id SERIAL PRIMARY KEY, description TEXT, type TEXT, priority TEXT, original_date TEXT, calculated_date TEXT, notes TEXT, status TEXT DEFAULT 'Pending', completed_date TEXT, operational_category TEXT DEFAULT 'TASK')",
+        "finances (id SERIAL PRIMARY KEY, type TEXT, area TEXT, concept TEXT, amount REAL, method TEXT, date TEXT, category TEXT DEFAULT 'General', subcategory TEXT DEFAULT 'General', account TEXT DEFAULT 'Cash', status TEXT DEFAULT 'Completed', is_reminder BOOLEAN DEFAULT FALSE)",
+        "dictionary (word TEXT PRIMARY KEY, category TEXT)",
+        "history (id SERIAL PRIMARY KEY, date TEXT, action TEXT, detail TEXT)",
+        "operation_history (id SERIAL PRIMARY KEY, table_name TEXT, record_id INTEGER, action TEXT, date TEXT)",
+        "config_accounts (name TEXT PRIMARY KEY, balance REAL DEFAULT 0)",
+        "config_categories (name TEXT PRIMARY KEY, type TEXT, keywords TEXT DEFAULT '')",
+        "budgets (category TEXT PRIMARY KEY, limit_amount REAL)",
+        "errors (id SERIAL PRIMARY KEY, date TEXT, module TEXT, error TEXT)",
+        "habits (id SERIAL PRIMARY KEY, name TEXT, streak INTEGER DEFAULT 0, last_date TEXT)",
+        "habit_history (id SERIAL PRIMARY KEY, habit_id INTEGER, date TEXT)"
     ]
-    for t in tablas: ejecutar_sql(f"CREATE TABLE IF NOT EXISTS {t}")
-    for idx in ["idx_tareas_fecha ON tareas(fecha_calculada)", "idx_tareas_estado ON tareas(estado)", "idx_finanzas_fecha ON finanzas(fecha)", "idx_finanzas_estado ON finanzas(estado)", "idx_finanzas_recordatorio ON finanzas(es_recordatorio)"]:
-        ejecutar_sql(f"CREATE INDEX IF NOT EXISTS {idx}")
+    for table in tables: execute_sql(f"CREATE TABLE IF NOT EXISTS {table}")
     
-    if not ejecutar_sql("SELECT 1 FROM config_cuentas LIMIT 1", fetch_one=True):
-        for c in ['Nu', 'BBVA', 'Banorte', 'Efectivo']: ejecutar_sql("INSERT INTO config_cuentas (nombre, saldo) VALUES (%s, 0)", (c,))
-    if not ejecutar_sql("SELECT 1 FROM config_categorias LIMIT 1", fetch_one=True):
+    for idx in ["idx_tasks_date ON tasks(calculated_date)", "idx_tasks_status ON tasks(status)", "idx_finances_date ON finances(date)", "idx_finances_status ON finances(status)", "idx_finances_reminder ON finances(is_reminder)"]:
+        execute_sql(f"CREATE INDEX IF NOT EXISTS {idx}")
+    
+    if not execute_sql("SELECT 1 FROM config_accounts LIMIT 1", fetch_one=True):
+        for c in ['Nu', 'Chase', 'Amex', 'Cash']: execute_sql("INSERT INTO config_accounts (name, balance) VALUES (%s, 0)", (c,))
+    if not execute_sql("SELECT 1 FROM config_categories LIMIT 1", fetch_one=True):
         cats = [
-            ('Servicios', 'Gasto', 'LUZ,AGUA,INTERNET,CFE,TELCEL,RENTA,GAS,TELÉFONO'), 
-            ('Transporte', 'Gasto', 'UBER,TAXI,GASOLINA,VUELO,CASETA,ESTACIONAMIENTO'), 
-            ('Alimentación', 'Gasto', 'DESPENSA,SUPER,RESTAURANTE,COMIDA,OXXO,WALMART,SORIANA,CENA'), 
-            ('Nómina', 'Ingreso', 'SUELDO,SALARIO,QUINCENA,PAGO')
+            ('Utilities', 'Expense', 'LIGHT,WATER,INTERNET,PHONE,RENT,GAS'),
+            ('Transport', 'Expense', 'UBER,TAXI,GAS,FLIGHT,TOLL,PARKING'),
+            ('Food', 'Expense', 'GROCERIES,SUPERMARKET,RESTAURANT,DINNER,LUNCH,WALMART'),
+            ('Payroll', 'Income', 'SALARY,PAYCHECK,INCOME,PAYMENT')
         ]
-        for c, t, p in cats: ejecutar_sql("INSERT INTO config_categorias (nombre, tipo, palabras_clave) VALUES (%s, %s, %s)", (c, t, p))
-    recargar_cache()
+        for c, t, k in cats: execute_sql("INSERT INTO config_categories (name, type, keywords) VALUES (%s, %s, %s)", (c, t, k))
+    reload_cache()
 
-def recargar_cache():
-    global CACHE_DICCIONARIO, CACHE_CUENTAS, CACHE_CATEGORIAS
-    filas_dicc = ejecutar_sql("SELECT palabra, categoria FROM diccionario", fetch_all=True) or []
-    CACHE_DICCIONARIO['EMPRESA'] = {f[0].upper(): 3 for f in filas_dicc if f[1] == 'Empresa'}
-    CACHE_DICCIONARIO['PERSONAL'] = {f[0].upper(): 3 for f in filas_dicc if f[1] == 'Personal'}
+def reload_cache():
+    global CACHE_DICTIONARY, CACHE_ACCOUNTS, CACHE_CATEGORIES
+    dict_rows = execute_sql("SELECT word, category FROM dictionary", fetch_all=True) or []
+    CACHE_DICTIONARY['BUSINESS'] = {f[0].upper(): 3 for f in dict_rows if f[1] == 'Business'}
+    CACHE_DICTIONARY['PERSONAL'] = {f[0].upper(): 3 for f in dict_rows if f[1] == 'Personal'}
     
-    CACHE_CUENTAS.clear()
-    for f in (ejecutar_sql("SELECT nombre FROM config_cuentas", fetch_all=True) or []): CACHE_CUENTAS[f[0].upper()] = f[0]
+    acc_rows = execute_sql("SELECT name FROM config_accounts", fetch_all=True) or []
+    CACHE_ACCOUNTS.clear()
+    for f in acc_rows: CACHE_ACCOUNTS[f[0].upper()] = f[0]
     
-    CACHE_CATEGORIAS.clear()
-    for nom, tip, pals in (ejecutar_sql("SELECT nombre, tipo, palabras_clave FROM config_categorias", fetch_all=True) or []):
-        CACHE_CATEGORIAS[nom.upper()] = nom
-        if pals: 
-            for p in pals.split(','): CACHE_CATEGORIAS[p.strip().upper()] = nom
+    cat_rows = execute_sql("SELECT name, type, keywords FROM config_categories", fetch_all=True) or []
+    CACHE_CATEGORIES.clear()
+    for name, typ, keywords in cat_rows:
+        CACHE_CATEGORIES[name.upper()] = name
+        if keywords:
+            for k in keywords.split(','): CACHE_CATEGORIES[k.strip().upper()] = name
 
-def sincronizar_saldos_db():
-    ejecutar_sql("UPDATE config_cuentas SET saldo = 0")
-    for tipo, monto, cuenta in (ejecutar_sql("SELECT tipo, monto, cuenta FROM finanzas WHERE estado='Completado' AND es_recordatorio = FALSE", fetch_all=True) or []):
-        ejecutar_sql(f"UPDATE config_cuentas SET saldo = saldo {'+' if tipo == 'Ingreso' else '-'} %s WHERE LOWER(nombre) = LOWER(%s)", (monto, cuenta))
+def sync_db_balances():
+    execute_sql("UPDATE config_accounts SET balance = 0")
+    movements = execute_sql("SELECT type, amount, account FROM finances WHERE status='Completed' AND is_reminder = FALSE", fetch_all=True) or []
+    for typ, amount, account in movements:
+        operator = "+" if typ == "Income" else "-"
+        execute_sql(f"UPDATE config_accounts SET balance = balance {operator} %s WHERE LOWER(name) = LOWER(%s)", (amount, account))
 
-def registrar_operacion(tabla, registro_id, accion):
-    ejecutar_sql("INSERT INTO historial_operaciones (tabla, registro_id, accion, fecha) VALUES (%s, %s, %s, %s)", (tabla, registro_id, accion, datetime.datetime.now(ZoneInfo('America/Monterrey')).isoformat()))
+def log_operation(table, record_id, action):
+    now_date = datetime.datetime.now(ZoneInfo('America/Monterrey')).isoformat()
+    execute_sql("INSERT INTO operation_history (table_name, record_id, action, date) VALUES (%s, %s, %s, %s)", (table, record_id, action, now_date))
 
-def registrar_error(modulo, error_msg):
-    ejecutar_sql("INSERT INTO errores (fecha, modulo, error) VALUES (%s, %s, %s)", (datetime.datetime.now(ZoneInfo('America/Monterrey')).strftime('%Y-%m-%d %H:%M:%S'), modulo, error_msg))
-    ejecutar_sql("DELETE FROM errores WHERE id IN (SELECT id FROM errores ORDER BY id DESC OFFSET 5000)")
+def log_audit(action, detail):
+    now_date = datetime.datetime.now(ZoneInfo('America/Monterrey')).strftime('%Y-%m-%d %H:%M:%S')
+    execute_sql("INSERT INTO history (date, action, detail) VALUES (%s, %s, %s)", (now_date, action, detail))
+
+def log_error(module, error_msg):
+    now_date = datetime.datetime.now(ZoneInfo('America/Monterrey')).strftime('%Y-%m-%d %H:%M:%S')
+    execute_sql("INSERT INTO errors (date, module, error) VALUES (%s, %s, %s)", (now_date, module, error_msg))
+    execute_sql("DELETE FROM errors WHERE id IN (SELECT id FROM errors ORDER BY id DESC OFFSET 5000)")
 
 # ==========================================
-# 4. COMANDOS DE CONFIGURACIÓN Y ADMINISTRACIÓN
+# 4. COMMANDS, BACKUP, UNDO & UTILS
 # ==========================================
-async def add_cuenta(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ALLOWED_USERS: return
-    nombre = " ".join(context.args)
-    if nombre:
-        ejecutar_sql("INSERT INTO config_cuentas (nombre) VALUES (%s) ON CONFLICT DO NOTHING", (nombre,))
-        recargar_cache()
-        await update.message.reply_text(f"✅ Cuenta '{nombre}' agregada al sistema.")
-
-async def set_presupuesto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ALLOWED_USERS: return
-    try:
-        categoria = context.args[0]
-        limite = float(context.args[1])
-        ejecutar_sql("INSERT INTO presupuestos (categoria, limite) VALUES (%s, %s) ON CONFLICT (categoria) DO UPDATE SET limite = EXCLUDED.limite", (categoria.capitalize(), limite))
-        await update.message.reply_text(f"✅ Presupuesto de ${limite} establecido para '{categoria}'.")
-    except:
-        await update.message.reply_text("⚠️ Uso incorrecto. Escribe: `/presupuesto Comida 5000`", parse_mode='Markdown')
-
-async def recalcular_saldos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ALLOWED_USERS: return
-    sincronizar_saldos_db()
-    await update.message.reply_text("✅ Saldos sincronizados desde el historial de finanzas.")
-
-async def comando_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ALLOWED_USERS: return
-    hoy = datetime.date.today().strftime('%Y-%m-%d')
-    mes_actual = datetime.datetime.now().strftime('%Y-%m')
-    
-    tareas = ejecutar_sql("SELECT descripcion, prioridad FROM tareas WHERE fecha_calculada <= %s AND estado = 'Pendiente'", (hoy,), fetch_all=True) or []
-    pagos = ejecutar_sql("SELECT concepto, monto, fecha, es_recordatorio FROM finanzas WHERE fecha <= %s AND estado = 'Pendiente'", (hoy,), fetch_all=True) or []
-    fins = ejecutar_sql("SELECT tipo, monto FROM finanzas WHERE fecha LIKE %s AND estado = 'Completado' AND es_recordatorio = FALSE", (f"{mes_actual}-%",), fetch_all=True) or []
-    cuentas = ejecutar_sql("SELECT saldo FROM config_cuentas WHERE saldo != 0", fetch_all=True) or []
-    
-    ing = sum(f[1] for f in fins if f[0] == 'Ingreso')
-    gas = sum(f[1] for f in fins if f[0] == 'Gasto')
-    saldo_total = sum(c[0] for c in cuentas)
-    urgentes = sum(1 for t in tareas if t[1] == 'Urgente')
-
-    mensaje = f"📊 *DASHBOARD EJECUTIVO ({hoy})*\n\n💰 *Saldo total:* ${saldo_total:,.2f}\n📈 *Ingresos mes:* ${ing:,.2f}\n📉 *Gastos mes:* ${gas:,.2f}\n⚖️ *Balance mensual:* ${(ing - gas):,.2f}\n\n📝 *Pendientes hoy:* {len(tareas)}\n⚠️ *Urgentes:* {urgentes}\n"
-    if pagos:
-        mensaje += "\n🚨 *Próximos pagos/vencidos:*\n" + "".join([f"   {'🔴' if p[2] < hoy else '🔔'} {p[0]} - {'(Recordatorio)' if p[3] else f'${p[1]:,.2f}'}\n" for p in pagos[:3]])
-            
-    await update.message.reply_text(mensaje, parse_mode='Markdown', reply_markup=obtener_menu_principal())
-
-# ==========================================
-# 5. BACKUP Y DESHACER
-# ==========================================
-async def generar_y_enviar_backup(context: ContextTypes.DEFAULT_TYPE):
-    conn, c, archivos = None, None, []
+async def generate_and_send_backup(context: ContextTypes.DEFAULT_TYPE):
+    conn, c, files = None, None, []
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        for tabla in ['finanzas', 'tareas', 'presupuestos', 'habitos', 'historial_habitos']:
-            c.execute(f"SELECT * FROM {tabla}")
-            columnas = [desc[0] for desc in c.description]
-            path_temp = f"/tmp/backup_{tabla}.csv"
-            with open(path_temp, mode='w', encoding='utf-8-sig', newline='') as f:
+        for table in ['finances', 'tasks', 'budgets', 'errors', 'habits', 'habit_history']:
+            c.execute(f"SELECT * FROM {table}")
+            columns = [desc[0] for desc in c.description]
+            data = c.fetchall()
+            temp_path = f"/tmp/backup_{table}.csv"
+            with open(temp_path, mode='w', encoding='utf-8-sig', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(columnas)
-                writer.writerows(c.fetchall())
-            archivos.append(path_temp)
-    except Exception as e: registrar_error("BACKUP", str(e))
+                writer.writerow(columns)
+                writer.writerows(data)
+            files.append(temp_path)
+    except Exception as e:
+        log_error("BACKUP", str(e))
     finally:
         if c: c.close()
         if conn: db_pool.putconn(conn)
-    if archivos:
-        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="📦 *Respaldo Generado:*", parse_mode='Markdown')
-        for file_path in archivos:
-            with open(file_path, "rb") as f:
-                await context.bot.send_document(chat_id=MI_TELEGRAM_ID, document=f)
+    
+    if files:
+        await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text="📦 *Automatic Backup Generated:*", parse_mode='Markdown')
+        for file_path in files:
+            with open(file_path, 'rb') as f: await context.bot.send_document(chat_id=MY_TELEGRAM_ID, document=f)
             os.remove(file_path)
 
-async def comando_exportar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def command_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS: return
-    m = await update.message.reply_text("⏳ Generando reporte...")
-    await generar_y_enviar_backup(context)
+    m = await update.message.reply_text("⏳ Generating report and backups...")
+    await generate_and_send_backup(context)
     try: await m.delete()
-    except: pass
-
-async def comando_deshacer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ALLOWED_USERS: return
-    ultimo = ejecutar_sql("SELECT id, tabla, registro_id, accion FROM historial_operaciones ORDER BY id DESC LIMIT 1", fetch_one=True)
-    if not ultimo: return await update.message.reply_text("⚠️ No hay registros recientes para deshacer.")
-    
-    h_id, tabla, reg_id, accion = ultimo
-    if tabla == 'finanzas':
-        info = ejecutar_sql("SELECT tipo, monto, cuenta, estado, es_recordatorio, concepto FROM finanzas WHERE id = %s", (reg_id,), fetch_one=True)
-        if info:
-            if accion == 'INSERT':
-                ejecutar_sql("DELETE FROM finanzas WHERE id = %s", (reg_id,))
-                sincronizar_saldos_db()
-                await update.message.reply_text(f"✅ Se borró el registro financiero: '{info[5]}'. Saldos revertidos.")
-            elif accion == 'PAGO_REALIZADO':
-                ejecutar_sql("UPDATE finanzas SET estado = 'Pendiente' WHERE id = %s", (reg_id,))
-                sincronizar_saldos_db()
-                await update.message.reply_text(f"✅ El pago '{info[5]}' volvió a estado Pendiente. Saldo revertido.")
-    else:
-        info = ejecutar_sql("SELECT descripcion FROM tareas WHERE id = %s", (reg_id,), fetch_one=True)
-        if accion == 'INSERT':
-            ejecutar_sql("DELETE FROM tareas WHERE id = %s", (reg_id,))
-            if info: await update.message.reply_text(f"✅ Se borró la tarea/rutina: '{info[0]}'.")
-    ejecutar_sql("DELETE FROM historial_operaciones WHERE id = %s", (h_id,))
-
-# ==========================================
-# 6. NLP INTELIGENTE Y EXTRACCIÓN (spaCy)
-# ==========================================
-PALABRAS_EMPRESA_BASE = {'VIÁTICO': 3, 'VUELO': 2, 'GASOLINA': 2, 'UBER': 2, 'CLIENTE': 3, 'EMPRESA': 3, 'PROVEEDOR': 3, 'SAT': 3}
-PALABRAS_PERSONAL_BASE = {'DESPENSA': 3, 'LUZ': 3, 'AGUA': 3, 'INTERNET': 3, 'CFE': 3, 'RENTA': 3, 'CASA': 2, 'MÉDICO': 2, 'PERSONAL': 3, 'ROPA': 2}
-PALABRAS_GASTO = ['PAGUÉ', 'PAGUE', 'COMPRÉ', 'COMPRE', 'GASTÉ', 'GASTE', 'COSTÓ', 'PAGAR', 'TICKET', 'RECIBO']
-PALABRAS_INGRESO = ['DEPOSITÉ', 'DEPOSITE', 'TRANSFERÍ', 'COBRÉ', 'COBRE', 'SUELDO', 'PAGARON', 'INGRESO']
-STOPWORDS = PALABRAS_GASTO + PALABRAS_INGRESO + ['CUANTO', 'QUÉ', 'DIME', 'TENGO', 'QUE', 'Y', 'SON', 'ES', 'VOY', 'VA', 'HACER', 'ME', 'LE', 'SE', 'LO', 'DEL', 'AL', 'EL', 'LA', 'LOS', 'LAS', 'UN', 'UNA', 'MAÑANA', 'HOY', 'AYER', 'LUNES', 'MARTES', 'MIERCOLES', 'JUEVES', 'VIERNES', 'SABADO', 'DOMINGO', 'EN', 'PARA', 'DE', 'A', 'POR', 'CON', 'PESOS', 'MXN', 'ESTE', 'ESTA', 'YA', 'DÍA', 'DIA', 'CADA', 'TODOS']
-
-def extraer_entidades_spacy(texto):
-    if not nlp_spacy: return None, None
-    doc = nlp_spacy(texto)
-    verbos = [token.lemma_.upper() for token in doc if token.pos_ == "VERB"]
-    objetos = [token.text for token in doc if token.dep_ in ('obj', 'nsubj', 'obl', 'flat') and not token.is_stop]
-    return verbos, " ".join(objetos).title() if objetos else None
-
-def obtener_palabra_aprendizaje(texto):
-    if not texto: return None
-    try:
-        if nlp_spacy:
-            _, objeto = extraer_entidades_spacy(texto)
-            if objeto:
-                palabras_objeto = re.findall(r'\b[A-ZÁÉÍÓÚÑ]+\b', objeto.upper())
-                for palabra in palabras_objeto:
-                    if palabra not in {'PAGAR', 'PAGO', 'FACTURA', 'COMPRA', 'GENERAL'}:
-                        return palabra
     except Exception: pass
 
-    palabras_invalidas = {'DIA','HOY','AYER','MAÑANA','PASADO','PAGAR','PAGUE','COMPRE','GASTE','FACTURA','COMPRA','DEPOSITO','TRANSFERI','GENERAL'}
-    palabras = re.findall(r'\b[A-ZÁÉÍÓÚÑ]+\b', texto.upper())
-    palabras = [p for p in palabras if len(p) >= 3 and p not in palabras_invalidas]
-    return palabras[0] if palabras else None
+async def command_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS: return
+    last_op = execute_sql("SELECT id, table_name, record_id, action FROM operation_history ORDER BY id DESC LIMIT 1", fetch_one=True)
+    if not last_op:
+        return await update.message.reply_text("⚠️ No recent operations to undo.")
+    
+    hist_id, table, reg_id, action = last_op
+    
+    if table == 'finances':
+        info = execute_sql("SELECT type, amount, account, status, is_reminder, concept FROM finances WHERE id = %s", (reg_id,), fetch_one=True)
+        if info:
+            if action == 'INSERT':
+                execute_sql("DELETE FROM finances WHERE id = %s", (reg_id,))
+                sync_db_balances()
+                await update.message.reply_text(f"✅ Deleted financial record: '{info[5]}'. Balances reverted.")
+            elif action == 'PAYMENT_MADE':
+                execute_sql("UPDATE finances SET status = 'Pending' WHERE id = %s", (reg_id,))
+                sync_db_balances()
+                await update.message.reply_text(f"✅ Payment '{info[5]}' reverted to Pending status. Balance reverted.")
+    else:
+        info = execute_sql("SELECT description FROM tasks WHERE id = %s", (reg_id,), fetch_one=True)
+        if action == 'INSERT':
+            execute_sql("DELETE FROM tasks WHERE id = %s", (reg_id,))
+            if info: await update.message.reply_text(f"✅ Deleted task/routine: '{info[0]}'.")
+        
+    execute_sql("DELETE FROM operation_history WHERE id = %s", (hist_id,))
 
-def procesar_impacto_financiero(monto, tipo, cuenta, subcat, estado):
-    if estado != 'Completado' or monto == 0.0: return ""
-    sincronizar_saldos_db()
-    if tipo == "Gasto":
-        limite = ejecutar_sql("SELECT limite FROM presupuestos WHERE LOWER(categoria) = %s", (subcat.lower(),), fetch_one=True)
-        if limite:
-            gastado = ejecutar_sql("SELECT SUM(monto) FROM finanzas WHERE subcategoria = %s AND fecha LIKE %s AND estado = 'Completado' AND es_recordatorio = FALSE", (subcat, f"{datetime.datetime.now().strftime('%Y-%m')}-%"), fetch_one=True)[0] or 0
-            if gastado >= limite[0] * 0.85: return f"\n⚠️ *¡Presupuesto al {(gastado / limite[0]) * 100:.0f}%!* Has gastado ${gastado:,.0f} de ${limite[0]:,.0f} en {subcat}."
+async def command_recalculate_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS: return
+    sync_db_balances()
+    await update.message.reply_text("✅ Balances recalculated correctly from the history of real movements.")
+
+async def command_add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS: return
+    name = " ".join(context.args)
+    if name:
+        execute_sql("INSERT INTO config_accounts (name) VALUES (%s) ON CONFLICT DO NOTHING", (name,))
+        reload_cache()
+        await update.message.reply_text(f"✅ Account or payment method '{name}' added successfully.")
+
+async def command_set_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS: return
+    try:
+        category = context.args[0]
+        limit = float(context.args[1])
+        execute_sql("INSERT INTO budgets (category, limit_amount) VALUES (%s, %s) ON CONFLICT (category) DO UPDATE SET limit_amount = EXCLUDED.limit_amount", (category.capitalize(), limit))
+        await update.message.reply_text(f"✅ Budget of ${limit:,.2f} set for '{category}'.")
+    except Exception as e:
+        log_error("BUDGET", str(e))
+        await update.message.reply_text("⚠️ Correct usage: `/budget Food 5000`", parse_mode='Markdown')
+
+async def command_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS: return
+    today = datetime.date.today().strftime('%Y-%m-%d')
+    curr_month = datetime.datetime.now().strftime('%Y-%m')
+    
+    tasks = execute_sql("SELECT description, priority FROM tasks WHERE calculated_date <= %s AND status = 'Pending'", (today,), fetch_all=True) or []
+    payments = execute_sql("SELECT concept, amount, date, is_reminder FROM finances WHERE date <= %s AND status = 'Pending'", (today,), fetch_all=True) or []
+    fins = execute_sql("SELECT type, amount FROM finances WHERE date LIKE %s AND status = 'Completed' AND is_reminder = FALSE", (f"{curr_month}-%",), fetch_all=True) or []
+    accounts = execute_sql("SELECT name, balance FROM config_accounts WHERE balance != 0", fetch_all=True) or []
+    
+    inc = sum(f[1] for f in fins if f[0] == 'Income')
+    exp = sum(f[1] for f in fins if f[0] == 'Expense')
+    total_balance = sum(c[1] for c in accounts)
+    urgents = sum(1 for t in tasks if t[1] == 'Urgent')
+
+    msg = f"📊 *EXECUTIVE DASHBOARD ({today})*\n\n"
+    msg += f"💰 *Total Balance:* ${total_balance:,.2f}\n"
+    msg += f"📈 *Income this month:* ${inc:,.2f}\n📉 *Expenses this month:* ${exp:,.2f}\n⚖️ *Monthly Balance:* ${(inc - exp):,.2f}\n\n"
+    msg += f"📝 *Pending today:* {len(tasks)}\n⚠️ *Urgent:* {urgents}\n"
+    
+    if payments:
+        msg += "\n🚨 *Upcoming/Overdue payments:*\n" + "".join([f"   {'🔴' if p[2] < today else '🔔'} {p[0]} - {'(Reminder)' if p[3] else f'${p[1]:,.2f}'}\n" for p in payments[:3]])
+            
+    await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=get_main_menu())
+
+# ==========================================
+# 5. SMART NLP & EXTRACTION (spaCy)
+# ==========================================
+WORDS_BUSINESS_BASE = {'PERDIEM': 3, 'FLIGHT': 2, 'GAS': 2, 'UBER': 2, 'CLIENT': 3, 'BUSINESS': 3, 'PROVIDER': 3, 'TAX': 3}
+WORDS_PERSONAL_BASE = {'GROCERIES': 3, 'LIGHT': 3, 'WATER': 3, 'INTERNET': 3, 'RENT': 3, 'HOUSE': 2, 'DOCTOR': 2, 'PERSONAL': 3, 'CLOTHES': 2}
+WORDS_EXPENSE = ['PAID', 'BOUGHT', 'SPENT', 'COST', 'PAY', 'TICKET', 'RECEIPT']
+WORDS_INCOME = ['DEPOSITED', 'TRANSFERRED', 'EARNED', 'SALARY', 'INCOME', 'RECEIVED']
+STOPWORDS = WORDS_EXPENSE + WORDS_INCOME + ['HOW', 'MUCH', 'WHAT', 'TELL', 'ME', 'HAVE', 'AND', 'ARE', 'IS', 'AM', 'WILL', 'DO', 'THE', 'A', 'AN', 'TOMORROW', 'TODAY', 'YESTERDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY', 'IN', 'FOR', 'OF', 'TO', 'BY', 'WITH', 'DOLLARS', 'USD', 'THIS', 'EVERY', 'ALL']
+
+def extract_spacy_entities(text):
+    if not nlp_spacy: return None, None
+    doc = nlp_spacy(text)
+    verbs = [token.lemma_.upper() for token in doc if token.pos_ == "VERB"]
+    objects = [token.text for token in doc if token.dep_ in ('dobj', 'nsubj', 'pobj', 'compound') and not token.is_stop]
+    clean_obj = " ".join(objects).title() if objects else None
+    return verbs, clean_obj
+
+def get_learning_word(text):
+    if not text: return None
+    verbs, spacy_obj = extract_spacy_entities(text)
+    if spacy_obj: return spacy_obj.split()[0].upper()
+    
+    invalid_words = {'DAY','TODAY','YESTERDAY','TOMORROW','PAID','BOUGHT','SPENT','INVOICE','PURCHASE','DEPOSIT','TRANSFERRED','RECORD','GENERAL'}
+    words = re.findall(r'\b[A-Z]+\b', text.upper())
+    words = [w for w in words if len(w) >= 3 and w not in invalid_words]
+    return words[0] if words else None
+
+def process_financial_impact(amount, typ, account_name, subcat, status):
+    if status != 'Completed' or amount == 0.0: return ""
+    sync_db_balances()
+    if typ == "Expense":
+        limit = execute_sql("SELECT limit_amount FROM budgets WHERE LOWER(category) = %s", (subcat.lower(),), fetch_one=True)
+        if limit:
+            curr_month = datetime.datetime.now().strftime('%Y-%m')
+            spent = execute_sql("SELECT SUM(amount) FROM finances WHERE subcategory = %s AND date LIKE %s AND status = 'Completed' AND is_reminder = FALSE", (subcat, f"{curr_month}-%"), fetch_one=True)[0] or 0
+            if spent >= limit[0] * 0.85:
+                return f"\n⚠️ *Budget at {(spent / limit[0]) * 100:.0f}%!* You've spent ${spent:,.0f} of ${limit[0]:,.0f} in {subcat}."
     return ""
 
-def extraer_fecha(texto):
-    fechas = search_dates(texto, languages=['es'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'America/Monterrey'})
-    return fechas[0][1].strftime('%Y-%m-%d') if fechas else None
+def extract_date(text):
+    dates = search_dates(text, languages=['en'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'America/Monterrey'})
+    return dates[0][1].strftime('%Y-%m-%d') if dates else None
 
-def calcular_siguiente_rutina(texto, fecha_actual_str):
-    f_actual, texto_upper = datetime.datetime.strptime(fecha_actual_str, "%Y-%m-%d"), texto.upper()
-    dias = {'LUNES':0, 'MARTES':1, 'MIÉRCOLES':2, 'MIERCOLES':2, 'JUEVES':3, 'VIERNES':4, 'SÁBADO':5, 'SABADO':5, 'DOMINGO':6}
-    for d_str, d_idx in dias.items():
-        if d_str in texto_upper:
-            d_adelante = (d_idx - f_actual.weekday() + 7) % 7
-            return (f_actual + datetime.timedelta(days=d_adelante if d_adelante != 0 else 7)).strftime('%Y-%m-%d')
-    return (f_actual + datetime.timedelta(days=7 if 'SEMANA' in texto_upper else 30 if 'MES' in texto_upper else 1)).strftime('%Y-%m-%d')
+def calculate_next_routine(text, current_date_str):
+    curr_date = datetime.datetime.strptime(current_date_str, "%Y-%m-%d")
+    text_upper = text.upper()
+    days = {'MONDAY':0, 'TUESDAY':1, 'WEDNESDAY':2, 'THURSDAY':3, 'FRIDAY':4, 'SATURDAY':5, 'SUNDAY':6}
+    for day_str, day_idx in days.items():
+        if day_str in text_upper:
+            days_ahead = (day_idx - curr_date.weekday() + 7) % 7
+            return (curr_date + datetime.timedelta(days=days_ahead if days_ahead != 0 else 7)).strftime('%Y-%m-%d')
+    if 'WEEK' in text_upper: return (curr_date + datetime.timedelta(days=7)).strftime('%Y-%m-%d')
+    elif 'MONTH' in text_upper: return (curr_date + datetime.timedelta(days=30)).strftime('%Y-%m-%d')
+    else: return (curr_date + datetime.timedelta(days=1)).strftime('%Y-%m-%d')
 
-def responder_consulta_inteligente(texto_min):
-    resp, f_fecha, f_str = "🤖 *Respuesta Analítica:*\n\n", "", "históricamente"
-    if "este año" in texto_min: f_fecha, f_str = f"AND fecha LIKE '{datetime.datetime.now().strftime('%Y')}-%'", "este año"
-    elif "este mes" in texto_min: f_fecha, f_str = f"AND fecha LIKE '{datetime.datetime.now().strftime('%Y-%m')}-%'", "este mes"
+def answer_smart_query(text_min):
+    resp = "🤖 *Analytical Response:*\n\n"
+    curr_year, curr_month = datetime.datetime.now().strftime('%Y'), datetime.datetime.now().strftime('%Y-%m')
+    f_date, f_str = "", "historically"
+    if "this year" in text_min: f_date, f_str = f"AND date LIKE '{curr_year}-%'", "this year"
+    elif "this month" in text_min: f_date, f_str = f"AND date LIKE '{curr_month}-%'", "this month"
     
-    if any(k in texto_min for k in ["dinero", "saldo", "cuentas"]):
-        res = ejecutar_sql("SELECT nombre, saldo FROM config_cuentas ORDER BY saldo DESC", fetch_all=True)
-        return resp + f"💰 *Saldos Actuales:*\n" + "".join([f"▫️ {r[0]}: ${r[1]:,.2f}\n" for r in res])
-    elif "gasté en" in texto_min or "gaste en" in texto_min:
-        palabra = re.sub(r'(este año|este mes|cuanto|cuánto)', '', texto_min.split("en ")[-1]).strip().replace("?", "")
-        res = ejecutar_sql(f"SELECT SUM(monto) FROM finanzas WHERE tipo = 'Gasto' AND estado = 'Completado' AND es_recordatorio = FALSE {f_fecha} AND (LOWER(concepto) LIKE %s OR LOWER(subcategoria) LIKE %s)", (f"%{palabra}%", f"%{palabra}%"), fetch_one=True)
-        return resp + f"Has gastado **${(res[0] or 0):,.2f}** en '{palabra.capitalize()}' {f_str}."
+    if "money" in text_min or "balance" in text_min or "accounts" in text_min:
+        res = execute_sql("SELECT name, balance FROM config_accounts ORDER BY balance DESC", fetch_all=True)
+        return resp + f"💰 *Current Balances:*\n" + "".join([f"▫️ {r[0]}: ${r[1]:,.2f}\n" for r in res])
+    elif "spent on" in text_min:
+        word = re.sub(r'(this year|this month|how much)', '', text_min.split("on ")[-1]).strip().replace("?", "")
+        res = execute_sql(f"SELECT SUM(amount) FROM finances WHERE type = 'Expense' AND status = 'Completed' AND is_reminder = FALSE {f_date} AND (LOWER(concept) LIKE %s OR LOWER(subcategory) LIKE %s)", (f"%{word}%", f"%{word}%"), fetch_one=True)
+        return resp + f"You have spent **${(res[0] or 0):,.2f}** on '{word.capitalize()}' {f_str}."
     return False
 
-def analizar_texto_local(texto):
-    texto_upper, texto_min = texto.upper(), texto.lower()
-    PATRONES_CONSULTA = ['cuanto', 'cuánto', 'que', 'qué', 'dime', 'muéstrame', 'muestrame', 'cual', 'cuál', 'saldo', 'gaste', 'gasté', 'balance', 'cuentas', 'promedio', 'pendientes']
+def analyze_local_text(text):
+    text_upper, text_min = text.upper(), text.lower()
     
-    if any(patron in texto_min for patron in PATRONES_CONSULTA):
-        resp = responder_consulta_inteligente(texto_min)
-        if resp: return {"tipo_registro": "consulta", "respuesta": resp}
+    if any(q in text_min for q in ["how much", "what", "tell me", "show me", "which"]):
+        resp = answer_smart_query(text_min)
+        if resp: return {"record_type": "query", "response": resp}
 
-    dict_emp, dict_per = {**PALABRAS_EMPRESA_BASE, **CACHE_DICCIONARIO.get('EMPRESA', {})}, {**PALABRAS_PERSONAL_BASE, **CACHE_DICCIONARIO.get('PERSONAL', {})}
-    score_emp, score_per = sum(p for w, p in dict_emp.items() if w in texto_upper), sum(p for w, p in dict_per.items() if w in texto_upper)
-    area = "Desconocida" if score_emp == 0 and score_per == 0 else ("Empresa" if score_emp > score_per else "Personal")
+    dict_biz, dict_per = {**WORDS_BUSINESS_BASE, **CACHE_DICTIONARY.get('BUSINESS', {})}, {**WORDS_PERSONAL_BASE, **CACHE_DICTIONARY.get('PERSONAL', {})}
+    score_biz, score_per = sum(p for w, p in dict_biz.items() if w in text_upper), sum(p for w, p in dict_per.items() if w in text_upper)
+    area = "Unknown" if score_biz == 0 and score_per == 0 else ("Business" if score_biz > score_per else "Personal")
     
-    es_gasto, es_ingreso = any(p in texto_upper for p in PALABRAS_GASTO), any(p in texto_upper for p in PALABRAS_INGRESO)
-    match_monto = re.search(r'\$?\s*([\d,]+(?:\.\d{1,2})?)\b', texto_upper)
-    hoy_str = datetime.date.today().strftime('%Y-%m-%d')
+    is_expense = any(p in text_upper for p in WORDS_EXPENSE)
+    is_income = any(p in text_upper for p in WORDS_INCOME)
+    match_amount = re.search(r'\$?\s*([\d,]+(?:\.\d{1,2})?)\b', text_upper)
+    today_str = datetime.date.today().strftime('%Y-%m-%d')
     
-    verbos_spacy, objeto_spacy = extraer_entidades_spacy(texto)
-    palabra_limpia = re.sub(r'\$?\s*([\d,]+(?:\.\d{1,2})?)\b', '', texto_upper).strip()
-    palabra_limpia = re.sub(r'[^\w\s]', ' ', palabra_limpia)
-    for w in STOPWORDS + list(CACHE_CUENTAS.keys()): palabra_limpia = re.sub(rf'\b{w}\b', '', palabra_limpia).strip()
-    concepto_final = objeto_spacy if objeto_spacy else (palabra_limpia.title() or "Registro general")
+    spacy_verbs, spacy_obj = extract_spacy_entities(text)
+    clean_word = re.sub(r'\$?\s*([\d,]+(?:\.\d{1,2})?)\b', '', text_upper).strip()
+    clean_word = re.sub(r'[^\w\s]', ' ', clean_word)
+    for w in STOPWORDS + list(CACHE_ACCOUNTS.keys()): clean_word = re.sub(rf'\b{w}\b', '', clean_word)
+    clean_word = clean_word.strip().title()
+    final_concept = spacy_obj if spacy_obj else (clean_word or "General record")
     
-    if es_gasto or es_ingreso or match_monto or (verbos_spacy and any(v in ['PAGAR', 'COMPRAR', 'DEPOSITAR', 'COBRAR', 'GASTAR'] for v in verbos_spacy)):
-        tipo_finanza = "Ingreso" if es_ingreso and not es_gasto else "Gasto"
-        monto = float(match_monto.group(1).replace(',', '')) if match_monto else 0.0
-        fecha_calc = extraer_fecha(texto) or hoy_str
+    if is_expense or is_income or match_amount or (spacy_verbs and any(v in ['PAY', 'BUY', 'DEPOSIT', 'CHARGE', 'SPEND'] for v in spacy_verbs)):
+        fin_type = "Income" if is_income and not is_expense else "Expense"
+        amount = float(match_amount.group(1).replace(',', '')) if match_amount else 0.0
+        calc_date = extract_date(text) or today_str
         
-        cuenta_detectada = 'Efectivo'
-        for c_low, c_orig in CACHE_CUENTAS.items(): 
-            if c_low in texto_min: 
-                cuenta_detectada = c_orig
-                break
-                
-        subcat = 'General'
-        for c_key, c_orig in CACHE_CATEGORIAS.items():
-            if c_key in texto_upper: subcat = c_orig; break
+        f_status = 'Pending' if (calc_date > today_str or amount == 0.0) else 'Completed'
+        detected_acc = 'Cash'
+        for c_key, c_orig in CACHE_ACCOUNTS.items(): 
+            if c_key in text_upper: detected_acc = c_orig; break
             
-        return {
-            "tipo_registro": "finanza", "tipo": tipo_finanza, "area": area, 
-            "concepto": concepto_final[:40], "monto": monto, "metodo": cuenta_detectada, "fecha": fecha_calc, 
-            "estado": 'Pendiente' if (fecha_calc > hoy_str or monto == 0.0) else 'Completado', "subcategoria": subcat, 
-            "es_recordatorio": (monto == 0.0), "palabra_clave": palabra_limpia
-        }
+        subcat = 'General'
+        for c_key, c_orig in CACHE_CATEGORIES.items():
+            if c_key in text_upper: subcat = c_orig; break
+        
+        return {"record_type": "finance", "type": fin_type, "area": area, "concept": final_concept[:40], "amount": amount, "method": detected_acc, "date": calc_date, "status": f_status, "subcategory": subcat, "is_reminder": (amount == 0.0), "keyword": clean_word}
     
-    es_rutina = bool(re.search(r'(CADA|TODOS LOS|DIARIO|SIEMPRE)', texto_upper))
-    return {
-        "tipo_registro": "tarea", "descripcion": texto[:60].capitalize(), "tipo": area, "prioridad": "Urgente" if "URGENTE" in texto_upper else "Rutina", 
-        "fecha_original": texto, "fecha_calculada": extraer_fecha(texto) or hoy_str, "categoria_operativa": "RUTINA" if es_rutina else "TAREA", "palabra_clave": palabra_limpia
-    }
+    is_routine = bool(re.search(r'(EVERY|DAILY|ALWAYS)', text_upper))
+    return {"record_type": "task", "description": text[:60].capitalize(), "type": area, "priority": "Urgent" if "URGENT" in text_upper else "Routine", "original_date": text, "calculated_date": extract_date(text) or today_str, "operational_category": "ROUTINE" if is_routine else "TASK", "keyword": clean_word}
 
 # ==========================================
-# 7. ENTRADA Y FLUJO DE DATOS
+# 6. DATA INGESTION & FLOW
 # ==========================================
-async def guardar_datos_nlp(bot, chat_id, datos, context=None):
-    if datos.get('tipo_registro') == 'consulta':
-        return await bot.send_message(chat_id=chat_id, text=datos['respuesta'], parse_mode='Markdown')
+async def save_nlp_data(bot, chat_id, data, context=None):
+    if data.get('record_type') == 'query':
+        await bot.send_message(chat_id=chat_id, text=data['response'], parse_mode='Markdown')
+        return
 
-    if datos.get('monto', 0) > 10000 and not datos.get('confirmado'):
-        datos['tipo_registro_original'], datos['tipo_registro'] = datos['tipo_registro'], 'confirmacion_alta'
-        if context: context.user_data['pending_alta'] = datos
-        return await bot.send_message(chat_id=chat_id, text=f"⚠️ *Atención:* Movimiento por **${datos['monto']:,.2f}**. ¿Confirmas?", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Confirmar ${datos['monto']:,.2f}", callback_data="confirmar_alto")]]))
+    if data.get('amount', 0) > 10000 and not data.get('confirmed'):
+        data['original_record_type'] = data['record_type']
+        data['record_type'] = 'high_amount_confirm'
+        if context: context.user_data['pending_high_amount'] = data
+        await bot.send_message(chat_id=chat_id, text=f"⚠️ *Attention:* Transaction for **${data['amount']:,.2f}**. Confirm?", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Confirm ${data['amount']:,.2f}", callback_data="confirm_high")]]))
+        return
 
-    if datos['tipo_registro'] == 'tarea':
-        res = ejecutar_sql("INSERT INTO tareas (descripcion, tipo, prioridad, fecha_original, fecha_calculada, categoria_operativa) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
-                  (datos['descripcion'], datos['tipo'], datos['prioridad'], datos['fecha_original'], datos['fecha_calculada'], datos['categoria_operativa']), fetch_one=True)
-        if res: registrar_operacion('tareas', res[0], 'INSERT')
-        msg = MSG_EXITO_TAREA.format(cat_op=datos['categoria_operativa'], desc=datos['descripcion'], fecha=datos['fecha_calculada'], area=datos['tipo'])
+    if data['record_type'] == 'task':
+        res = execute_sql("INSERT INTO tasks (description, type, priority, original_date, calculated_date, operational_category) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                  (data['description'], data['type'], data['priority'], data['original_date'], data['calculated_date'], data['operational_category']), fetch_one=True)
+        if res: log_operation('tasks', res[0], 'INSERT')
+        msg = MSG_SUCCESS_TASK.format(cat_op=data['operational_category'], desc=data['description'], date=data['calculated_date'], area=data['type'])
         
-    elif datos['tipo_registro'] == 'finanza':
-        est, subcat, cta, es_rec = datos.get('estado', 'Completado'), datos.get('subcategoria', 'General'), datos.get('metodo', 'Efectivo'), datos.get('es_recordatorio', False)
-        res = ejecutar_sql("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha, categoria, estado, subcategoria, cuenta, es_recordatorio) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-                  (datos['tipo'], datos['area'], datos['concepto'], datos['monto'], cta, datos['fecha'], 'General', est, subcat, cta, es_rec), fetch_one=True)
-        if res: registrar_operacion('finanzas', res[0], 'INSERT')
+    elif data['record_type'] == 'finance':
+        f_status, subcat, acc = data.get('status', 'Completed'), data.get('subcategory', 'General'), data.get('method', 'Cash')
+        is_rem_fin = data.get('is_reminder', False)
+        res = execute_sql("INSERT INTO finances (type, area, concept, amount, method, date, category, status, subcategory, account, is_reminder) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                  (data['type'], data['area'], data['concept'], data['amount'], acc, data['date'], 'General', f_status, subcat, acc, is_rem_fin), fetch_one=True)
+        if res: log_operation('finances', res[0], 'INSERT')
+        alert_budget = process_financial_impact(data['amount'], data['type'], acc, subcat, f_status)
+        emoji = "⏳ Pending" if f_status == 'Pending' else "✅ Completed"
+        msg = MSG_SUCCESS_FINANCE.format(concept=data['concept'], amount=data['amount'], cat=subcat, account=acc, date=data['date'], status=emoji, alert=alert_budget)
+        if is_rem_fin: msg = msg.replace("💲 $0.00", "🔔 (Financial Reminder)")
         
-        alerta = procesar_impacto_financiero(datos['monto'], datos['tipo'], cta, subcat, est)
-        msg = MSG_EXITO_FINANZA.format(concepto=datos['concepto'], monto=datos['monto'], cat=subcat, cuenta=cta, fecha=datos['fecha'], estado="⏳ Pendiente" if est == 'Pendiente' else "✅ Completado", alerta=alerta)
-        if es_rec: msg = msg.replace("💲 $0.00", "🔔 (Recordatorio)")
-        
-    await bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown', reply_markup=obtener_menu_principal())
+    await bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown', reply_markup=get_main_menu())
 
-async def manejar_resultado_analisis(update, context, datos):
-    if datos.get('area') == "Desconocida":
-        context.user_data['pendiente_clasificar'] = datos
-        palabra = obtener_palabra_aprendizaje(datos.get('palabra_clave') or datos.get('concepto') or datos.get('descripcion'))
-        if not palabra:
-            datos['area' if datos.get('tipo_registro') == 'finanza' else 'tipo'] = 'Personal'
-            return await guardar_datos_nlp(context.bot, MI_TELEGRAM_ID, datos, context)
-        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"🤔 No reconozco si *'{palabra.title()}'* es Empresa o Personal.\nClasifícalo:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏢 Empresa", callback_data='aprender_empresa')], [InlineKeyboardButton("👤 Personal", callback_data='aprender_personal')]]), parse_mode='Markdown')
-    else:
-        await guardar_datos_nlp(context.bot, MI_TELEGRAM_ID, datos, context)
+async def handle_analysis_result(update, context, data):
+    if data.get('area') == "Unknown":
+        context.user_data['pending_classification'] = data
+        text_learn = data.get('keyword') or data.get('concept') or data.get('description')
+        word = get_learning_word(text_learn)
+        if not word:
+            data['area' if data.get('record_type') == 'finance' else 'type'] = 'Personal'
+            await save_nlp_data(context.bot, MY_TELEGRAM_ID, data, context)
+            return
+        keyboard = [[InlineKeyboardButton("🏢 Business", callback_data='learn_business')], [InlineKeyboardButton("👤 Personal", callback_data='learn_personal')]]
+        await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=f"🤔 I don't know if *'{word.title()}'* is Business or Personal.\nClassify it:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else: await save_nlp_data(context.bot, MY_TELEGRAM_ID, data, context)
 
-async def procesar_texto_libre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def process_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS: return
-    m = await update.message.reply_text("🧠 *Procesando...*", parse_mode='Markdown')
-    await manejar_resultado_analisis(update, context, analizar_texto_local(update.message.text))
+    m = await update.message.reply_text("🧠 *Processing...*", parse_mode='Markdown')
+    await handle_analysis_result(update, context, analyze_local_text(update.message.text))
     try: await m.delete()
-    except: pass
+    except Exception: pass
 
-async def procesar_audio_local(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def process_local_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS: return
-    if update.message.voice.duration > 60: return await update.message.reply_text(MSG_AUDIO_LARGO)
-    m = await update.message.reply_text("🎙️ *Transcribiendo...*", parse_mode='Markdown')
-    tmp_ogg, tmp_wav = "", ""
+    if update.message.voice.duration > 60:
+        await update.message.reply_text(MSG_AUDIO_LONG); return
+    m = await update.message.reply_text("🎙️ *Transcribing...*", parse_mode='Markdown')
+    temp_audio_path = wav_path = ""
     try:
-        archivo = await context.bot.get_file(update.message.voice.file_id)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f: tmp_ogg = f.name
-        await archivo.download_to_drive(tmp_ogg)
-        tmp_wav = tmp_ogg.replace(".ogg", ".wav")
-        AudioSegment.from_ogg(tmp_ogg).export(tmp_wav, format="wav")
-        with sr.AudioFile(tmp_wav) as source: texto = sr.Recognizer().recognize_google(sr.Recognizer().record(source), language="es-MX")
-        if len(texto.strip()) < 3: raise Exception("Audio vacío")
-        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"🗣️ _\"{texto}\"_", parse_mode='Markdown')
-        await manejar_resultado_analisis(update, context, analizar_texto_local(texto))
+        file = await context.bot.get_file(update.message.voice.file_id)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as temp_audio: temp_audio_path = temp_audio.name
+        await file.download_to_drive(temp_audio_path)
+        wav_path = temp_audio_path.replace(".ogg", ".wav")
+        AudioSegment.from_ogg(temp_audio_path).export(wav_path, format="wav")
+        with sr.AudioFile(wav_path) as source: text = sr.Recognizer().recognize_google(sr.Recognizer().record(source), language="en-US")
+        if len(text.strip()) < 3: raise Exception("Empty audio")
+        await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=f"🗣️ _\"{text}\"_", parse_mode='Markdown')
+        await handle_analysis_result(update, context, analyze_local_text(text))
     except Exception as e:
-        registrar_error("AUDIO", str(e))
-        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=MSG_ERROR)
-    finally:
-        if tmp_ogg and os.path.exists(tmp_ogg): os.remove(tmp_ogg)
-        if tmp_wav and os.path.exists(tmp_wav): os.remove(tmp_wav)
-        try: await m.delete()
-        except: pass
-
-async def procesar_foto_local(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ALLOWED_USERS: return
-    m = await update.message.reply_text("📸 *Escaneando OCR...*", parse_mode='Markdown')
-    tmp_jpg = ""
-    try:
-        archivo = await context.bot.get_file(update.message.photo[-1].file_id)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f: tmp_jpg = f.name
-        await archivo.download_to_drive(tmp_jpg)
-        img = Image.open(tmp_jpg).convert('L')
-        img.thumbnail((1200, 1200)) 
-        texto_crudo = pytesseract.image_to_string(img, lang='spa')
-        match = re.search(r'(?:TOTAL|IMPORTE|NETO|SUMA)[\s\$:]*([\d,]+\.\d{2})', texto_crudo, re.IGNORECASE)
-        if not match: raise Exception("Monto no detectado.")
-        await manejar_resultado_analisis(update, context, analizar_texto_local(f"ticket pagué {match.group(1)} {texto_crudo[:300]}"))
-    except Exception as e: 
-        registrar_error("OCR", str(e))
-        await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"⚠️ OCR Falló: Regístralo manualmente.")
+        log_error("AUDIO", str(e))
+        await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=MSG_ERROR)
     finally: 
-        if tmp_jpg and os.path.exists(tmp_jpg): os.remove(tmp_jpg)
+        if temp_audio_path and os.path.exists(temp_audio_path): os.remove(temp_audio_path)
+        if wav_path and os.path.exists(wav_path): os.remove(wav_path)
         try: await m.delete()
-        except: pass
+        except Exception: pass
+
+async def process_local_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS: return
+    m = await update.message.reply_text("📸 *Scanning OCR...*", parse_mode='Markdown')
+    temp_photo_path = ""
+    try:
+        file = await context.bot.get_file(update.message.photo[-1].file_id)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_photo: temp_photo_path = temp_photo.name
+        await file.download_to_drive(temp_photo_path)
+        img = Image.open(temp_photo_path).convert('L')
+        img.thumbnail((1200, 1200)) 
+        raw_text = pytesseract.image_to_string(img, lang='eng')
+        match = re.search(r'(?:TOTAL|AMOUNT|NET|SUM)[\s\$:]*([\d,]+\.\d{2})', raw_text, re.IGNORECASE)
+        if not match: raise Exception("Safe amount not detected.")
+        await handle_analysis_result(update, context, analyze_local_text(f"receipt paid {match.group(1)} {raw_text[:300]}"))
+    except Exception as e: 
+        log_error("OCR", str(e))
+        await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=f"⚠️ OCR Failed: Register manually.")
+    finally: 
+        if temp_photo_path and os.path.exists(temp_photo_path): os.remove(temp_photo_path)
+        try: await m.delete()
+        except Exception: pass
 
 # ==========================================
-# 8. EDICIÓN INTERACTIVA Y HÁBITOS
+# 7. INTERACTIVE EDITING & HABITS
 # ==========================================
-async def iniciar_edicion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_editing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS: return
     query = update.callback_query
     await query.answer()
     
-    if query.data.startswith('edit_f_'):
-        context.user_data['edit_id'], context.user_data['edit_tabla'] = query.data.split('_')[2], 'finanzas'
-        await query.edit_message_text(f"Editando Finanza #{context.user_data['edit_id']}. ¿Qué cambias?", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Monto", callback_data="edcampo_monto"), InlineKeyboardButton("Concepto", callback_data="edcampo_concepto")],
-            [InlineKeyboardButton("Fecha", callback_data="edcampo_fecha"), InlineKeyboardButton("Cuenta", callback_data="edcampo_cuenta")],
-            [InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]
-        ]))
-        return E_CAMPO
+    if query.data == 'edit_records':
+        fins = execute_sql("SELECT id, concept, amount FROM finances ORDER BY id DESC LIMIT 3", fetch_all=True) or []
+        tks = execute_sql("SELECT id, description, calculated_date FROM tasks ORDER BY id DESC LIMIT 3", fetch_all=True) or []
+        keyboard = [[InlineKeyboardButton(f"💸 {f[1][:15]} (${f[2]:.0f})", callback_data=f"edit_f_{f[0]}")] for f in fins]
+        keyboard.extend([[InlineKeyboardButton(f"📝 {t[1][:15]} ({t[2]})", callback_data=f"edit_t_{t[0]}")] for t in tks])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='back_home')])
+        await query.edit_message_text("Select the record to edit:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif query.data.startswith('edit_f_'):
+        context.user_data['edit_id'], context.user_data['edit_table'] = query.data.split('_')[2], 'finances'
+        keyboard = [[InlineKeyboardButton("Amount", callback_data="edfield_amount"), InlineKeyboardButton("Concept", callback_data="edfield_concept")],
+                   [InlineKeyboardButton("Date", callback_data="edfield_date"), InlineKeyboardButton("Account", callback_data="edfield_account")],
+                   [InlineKeyboardButton("🔙 Back", callback_data='edit_records')]]
+        await query.edit_message_text(f"Editing Finance #{context.user_data['edit_id']}. What to change?", reply_markup=InlineKeyboardMarkup(keyboard))
+        return E_FIELD
         
     elif query.data.startswith('edit_t_'):
-        context.user_data['edit_id'], context.user_data['edit_tabla'] = query.data.split('_')[2], 'tareas'
-        await query.edit_message_text(f"Editando Tarea #{context.user_data['edit_id']}. ¿Qué cambias?", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Descripción", callback_data="edcampo_descripcion"), InlineKeyboardButton("Fecha", callback_data="edcampo_fecha_calculada")],
-            [InlineKeyboardButton("Prioridad", callback_data="edcampo_prioridad"), InlineKeyboardButton("Estado", callback_data="edcampo_estado")],
-            [InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]
-        ]))
-        return E_CAMPO
+        context.user_data['edit_id'], context.user_data['edit_table'] = query.data.split('_')[2], 'tasks'
+        keyboard = [[InlineKeyboardButton("Description", callback_data="edfield_description"), InlineKeyboardButton("Date", callback_data="edfield_calculated_date")],
+                   [InlineKeyboardButton("Priority", callback_data="edfield_priority"), InlineKeyboardButton("Status", callback_data="edfield_status")],
+                   [InlineKeyboardButton("🔙 Back", callback_data='edit_records')]]
+        await query.edit_message_text(f"Editing Task #{context.user_data['edit_id']}. What to change?", reply_markup=InlineKeyboardMarkup(keyboard))
+        return E_FIELD
 
-async def capturar_campo_edicion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def capture_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['edit_campo'] = query.data.split('_')[1]
-    await query.edit_message_text(f"Escribe el nuevo valor para *{context.user_data['edit_campo']}*:", parse_mode='Markdown')
-    return E_VALOR
+    context.user_data['edit_field'] = query.data.split('_')[1]
+    await query.edit_message_text(f"Type the new value for *{context.user_data['edit_field']}*:", parse_mode='Markdown')
+    return E_VALUE
 
-async def guardar_edicion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    nuevo_valor, tabla, campo, reg_id = update.message.text, context.user_data.get('edit_tabla'), context.user_data.get('edit_campo'), context.user_data.get('edit_id')
-    if tabla not in ['finanzas', 'tareas']: return ConversationHandler.END
-    if tabla == 'finanzas' and campo not in ['monto', 'concepto', 'fecha', 'cuenta']: return ConversationHandler.END
-    if tabla == 'tareas' and campo not in ['descripcion', 'fecha_calculada', 'prioridad', 'estado']: return ConversationHandler.END
+async def save_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_val = update.message.text
+    table, field, reg_id = context.user_data.get('edit_table'), context.user_data.get('edit_field'), context.user_data.get('edit_id')
+    
+    if table not in ['finances', 'tasks']: return ConversationHandler.END
+    if table == 'finances' and field not in ['amount', 'concept', 'date', 'account']: return ConversationHandler.END
+    if table == 'tasks' and field not in ['description', 'calculated_date', 'priority', 'status']: return ConversationHandler.END
     
     try:
-        if campo == 'monto': nuevo_valor = float(nuevo_valor.replace('$', '').replace(',', ''))
-        elif campo in ['fecha', 'fecha_calculada']:
-            f_calc = dateparser.parse(nuevo_valor, languages=['es'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'America/Monterrey'})
-            if f_calc: nuevo_valor = f_calc.strftime('%Y-%m-%d')
-            else: raise Exception("Fecha inválida")
+        if field == 'amount': new_val = float(new_val.replace('$', '').replace(',', ''))
+        elif field in ['date', 'calculated_date']:
+            f_calc = dateparser.parse(new_val, languages=['en'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'America/Monterrey'})
+            if f_calc: new_val = f_calc.strftime('%Y-%m-%d')
+            else: raise Exception("Invalid Date")
             
-        ejecutar_sql(f"UPDATE {tabla} SET {campo} = %s WHERE id = %s", (nuevo_valor, reg_id))
-        registrar_operacion(tabla, reg_id, f'UPDATE_{campo}')
-        if tabla == 'finanzas': sincronizar_saldos_db()
-        await update.message.reply_text(f"✅ Registro #{reg_id} actualizado.", reply_markup=obtener_menu_principal())
+        execute_sql(f"UPDATE {table} SET {field} = %s WHERE id = %s", (new_val, reg_id))
+        log_operation(table, reg_id, f'UPDATE_{field}')
+        if table == 'finances': sync_db_balances()
+        
+        await update.message.reply_text(f"✅ Record #{reg_id} updated. {field} = {new_val}", reply_markup=get_main_menu())
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Error: {e}", reply_markup=obtener_menu_principal())
+        await update.message.reply_text(f"⚠️ Error saving: {e}", reply_markup=get_main_menu())
     context.user_data.clear()
     return ConversationHandler.END
 
 # ==========================================
-# 9. MENÚS, DASHBOARDS Y ALARMAS
+# 8. MENUS
 # ==========================================
-def obtener_menu_principal():
+def get_main_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📝 Agenda/Rutinas", callback_data='menu_tarea'), InlineKeyboardButton("💰 Finanzas", callback_data='menu_finanzas')],
-        [InlineKeyboardButton("🧘 Hábitos Semanales", callback_data='menu_habitos')],
-        [InlineKeyboardButton("⏱️ Modo Enfoque", callback_data='modo_enfoque'), InlineKeyboardButton("✏️ Editar Recientes", callback_data='editar_registros')]
+        [InlineKeyboardButton("📝 Tasks", callback_data='menu_task'), InlineKeyboardButton("💰 Finances", callback_data='menu_finance')],
+        [InlineKeyboardButton("📅 Dynamic Agenda", callback_data='view_calendar'), InlineKeyboardButton("🧘 Habits", callback_data='menu_habit')],
+        [InlineKeyboardButton("⏱️ Focus Mode", callback_data='focus_mode'), InlineKeyboardButton("✏️ Edit Recent", callback_data='edit_records')]
     ])
 
-async def manejador_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id not in ALLOWED_USERS: return
     await query.answer() 
 
-    if query.data == 'confirmar_alto':
-        datos = context.user_data.pop('pending_alta', None)
-        if datos:
-            datos['tipo_registro'], datos['confirmado'] = datos['tipo_registro_original'], True
-            await guardar_datos_nlp(context.bot, MI_TELEGRAM_ID, datos, context)
-            await query.edit_message_text("✅ Monto alto confirmado.")
+    if query.data == 'confirm_high':
+        data = context.user_data.pop('pending_high_amount', None)
+        if data:
+            data['record_type'], data['confirmed'] = data['original_record_type'], True
+            await save_nlp_data(context.bot, MY_TELEGRAM_ID, data, context)
+            await query.edit_message_text("✅ High amount confirmed.")
 
-    # --- EDICIÓN / BORRADO ---
-    elif query.data == 'editar_registros':
-        fins = ejecutar_sql("SELECT id, concepto, monto FROM finanzas ORDER BY id DESC LIMIT 3", fetch_all=True) or []
-        tars = ejecutar_sql("SELECT id, descripcion, fecha_calculada FROM tareas ORDER BY id DESC LIMIT 3", fetch_all=True) or []
-        teclado = [[InlineKeyboardButton(f"❌ Borrar {f[1][:8]}", callback_data=f"borrar_f_{f[0]}"), InlineKeyboardButton(f"✏️ Edit {f[1][:8]}", callback_data=f"edit_f_{f[0]}")] for f in fins]
-        teclado.extend([[InlineKeyboardButton(f"❌ Borrar {t[1][:8]}", callback_data=f"borrar_t_{t[0]}"), InlineKeyboardButton(f"✏️ Edit {t[1][:8]}", callback_data=f"edit_t_{t[0]}")] for t in tars])
-        teclado.append([InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')])
-        await query.edit_message_text("Selecciona el registro a borrar o editar:", reply_markup=InlineKeyboardMarkup(teclado))
+    # --- HABITS MENU ---
+    elif query.data == 'menu_habit':
+        habits = execute_sql("SELECT id, name, streak, last_date FROM habits ORDER BY id ASC", fetch_all=True) or []
+        keyboard = []
+        today_str = datetime.date.today().strftime('%Y-%m-%d')
+        for h in habits:
+            h_id, h_name, h_streak, h_last = h
+            icon = "✅" if h_last == today_str else "⬜"
+            keyboard.append([InlineKeyboardButton(f"{icon} {h_name} (Streak: {h_streak})", callback_data=f'check_habit_{h_id}')])
+        keyboard.append([InlineKeyboardButton("📊 View Stats", callback_data='stats_habits')])
+        keyboard.append([InlineKeyboardButton("➕ New Habit", callback_data='habit_new')])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='back_home')])
+        await query.edit_message_text("🧘 *Habit Tracker:*\nTap a habit to mark it as completed today.", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
-    elif query.data.startswith('borrar_f_'):
-        id_borrar = query.data.split('_')[2]
-        ejecutar_sql("DELETE FROM finanzas WHERE id = %s", (id_borrar,))
-        sincronizar_saldos_db()
-        await query.edit_message_text(f"✅ Finanza #{id_borrar} eliminada permanentemente.", reply_markup=obtener_menu_principal())
-
-    elif query.data.startswith('borrar_t_'):
-        id_borrar = query.data.split('_')[2]
-        ejecutar_sql("DELETE FROM tareas WHERE id = %s", (id_borrar,))
-        await query.edit_message_text(f"✅ Tarea #{id_borrar} eliminada permanentemente.", reply_markup=obtener_menu_principal())
-
-    # --- HÁBITOS ---
-    elif query.data == 'menu_habitos':
-        habitos = ejecutar_sql("SELECT id, nombre, racha, ultima_fecha FROM habitos ORDER BY id ASC", fetch_all=True) or []
-        teclado = []
-        hoy_str = datetime.date.today().strftime('%Y-%m-%d')
-        for h in habitos:
-            h_id, h_nom, h_racha, h_ult = h
-            icono = "✅" if h_ult == hoy_str else "⬜"
-            teclado.append([InlineKeyboardButton(f"{icono} {h_nom} (Racha: {h_racha})", callback_data=f'check_habito_{h_id}')])
-        teclado.append([InlineKeyboardButton("📊 Estadísticas", callback_data='stats_habitos')])
-        teclado.append([InlineKeyboardButton("➕ Nuevo Hábito", callback_data='habito_nuevo')])
-        teclado.append([InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')])
-        await query.edit_message_text("🧘 *Rastreador de Hábitos:*", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(teclado))
-
-    elif query.data.startswith('check_habito_'):
+    elif query.data.startswith('check_habit_'):
         h_id = query.data.split('_')[2]
-        res = ejecutar_sql("SELECT racha, ultima_fecha, nombre FROM habitos WHERE id = %s", (h_id,), fetch_one=True)
+        res = execute_sql("SELECT streak, last_date, name FROM habits WHERE id = %s", (h_id,), fetch_one=True)
+        msg = "Error reading habit."
         if res:
-            racha, ultima_fecha, nombre = res
-            hoy_str = datetime.date.today().strftime('%Y-%m-%d')
-            ayer_str = (datetime.date.today() - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
-            if ultima_fecha == hoy_str:
-                msg = f"Ya completaste '{nombre}' hoy. ¡Sigue así!"
-            else:
-                nueva_racha = racha + 1 if ultima_fecha == ayer_str else 1
-                ejecutar_sql("UPDATE habitos SET racha = %s, ultima_fecha = %s WHERE id = %s", (nueva_racha, hoy_str, h_id))
-                ejecutar_sql("INSERT INTO historial_habitos (habito_id, fecha) VALUES (%s, %s)", (h_id, hoy_str))
-                msg = f"🎉 ¡Hábito '{nombre}' completado!\n🔥 Racha actual: {nueva_racha} días."
-            await query.edit_message_text(f"{msg}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver a Hábitos", callback_data='menu_habitos')]]))
-            
-    elif query.data == 'stats_habitos':
-        hoy = datetime.date.today()
-        lunes = (hoy - datetime.timedelta(days=hoy.weekday())).strftime('%Y-%m-%d')
-        domingo = (hoy + datetime.timedelta(days=6 - hoy.weekday())).strftime('%Y-%m-%d')
-        mes_actual = hoy.strftime('%Y-%m')
-        
-        habitos = ejecutar_sql("SELECT id, nombre FROM habitos", fetch_all=True) or []
-        msg = "📊 *Estadísticas de Hábitos*\n\n"
-        for h_id, h_nom in habitos:
-            semanales = ejecutar_sql("SELECT COUNT(*) FROM historial_habitos WHERE habito_id = %s AND fecha BETWEEN %s AND %s", (h_id, lunes, domingo), fetch_one=True)[0]
-            mensuales = ejecutar_sql("SELECT COUNT(*) FROM historial_habitos WHERE habito_id = %s AND fecha LIKE %s", (h_id, f"{mes_actual}-%"), fetch_one=True)[0]
-            msg += f"▫️ *{h_nom}:*\n   Lunes a Domingo: {semanales} días\n   Mes Actual: {mensuales} días\n\n"
-        await query.edit_message_text(msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver a Hábitos", callback_data='menu_habitos')]]))
+            streak, last_date, name = res
+            today_date = datetime.date.today()
+            today_str = today_date.strftime('%Y-%m-%d')
+            yesterday_str = (today_date - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
 
-    # --- TAREAS ---
-    elif query.data == 'menu_tarea':
-        await query.edit_message_text("📝 *Agenda:*", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Registrar Manual", callback_data='tarea_nueva')], [InlineKeyboardButton("✅ Ver Pendientes / Rutinas", callback_data='listar_pendientes')], [InlineKeyboardButton("📅 Calendario 7 Días", callback_data='ver_calendario')], [InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]))
+            if last_date == today_str:
+                msg = f"You already completed '{name}' today. Keep it up!"
+            else:
+                new_streak = streak + 1 if last_date == yesterday_str else 1
+                execute_sql("UPDATE habits SET streak = %s, last_date = %s WHERE id = %s", (new_streak, today_str, h_id))
+                execute_sql("INSERT INTO habit_history (habit_id, date) VALUES (%s, %s)", (h_id, today_str))
+                msg = f"🎉 Habit '{name}' completed!\n🔥 Current streak: {new_streak} days."
+        await query.edit_message_text(f"{msg}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Habits", callback_data='menu_habit')]]))
+
+    elif query.data == 'stats_habits':
+        today = datetime.date.today()
+        monday = (today - datetime.timedelta(days=today.weekday())).strftime('%Y-%m-%d')
+        sunday = (today + datetime.timedelta(days=6 - today.weekday())).strftime('%Y-%m-%d')
+        curr_month = today.strftime('%Y-%m')
         
-    elif query.data == 'listar_pendientes':
-        pendientes = ejecutar_sql("SELECT id, descripcion, categoria_operativa FROM tareas WHERE estado = 'Pendiente' ORDER BY fecha_calculada ASC LIMIT 8", fetch_all=True) or []
-        if not pendientes: return await query.edit_message_text("🎉 Todo al día.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='menu_tarea')]]))
-        teclado = [[InlineKeyboardButton(f"{'🔁' if p[2]=='RUTINA' else '✅'} {p[1][:25]}", callback_data=f'completar_t_{p[0]}')] for p in pendientes]
-        teclado.append([InlineKeyboardButton("🔙 Volver", callback_data='menu_tarea')])
-        await query.edit_message_text("Selecciona para COMPLETAR:", reply_markup=InlineKeyboardMarkup(teclado))
+        habits = execute_sql("SELECT id, name FROM habits", fetch_all=True) or []
+        msg = "📊 *Habit Statistics*\n\n"
+        for h_id, h_name in habits:
+            weekly = execute_sql("SELECT COUNT(*) FROM habit_history WHERE habit_id = %s AND date BETWEEN %s AND %s", (h_id, monday, sunday), fetch_one=True)[0]
+            monthly = execute_sql("SELECT COUNT(*) FROM habit_history WHERE habit_id = %s AND date LIKE %s", (h_id, f"{curr_month}-%"), fetch_one=True)[0]
+            msg += f"▫️ *{h_name}:*\n   This Week: {weekly} days\n   This Month: {monthly} days\n\n"
+            
+        await query.edit_message_text(msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Habits", callback_data='menu_habit')]]))
+
+    # --- TASKS MENU ---
+    elif query.data == 'menu_task':
+        await query.edit_message_text("📝 *Agenda:*", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Register Manual", callback_data='task_new')], [InlineKeyboardButton("✅ View Pending / Routines", callback_data='list_pending')], [InlineKeyboardButton("🔙 Back", callback_data='back_home')]]))
         
-    elif query.data.startswith('completar_t_'):
-        id_tarea = query.data.split('_')[2]
-        info = ejecutar_sql("SELECT categoria_operativa, fecha_original, fecha_calculada FROM tareas WHERE id = %s", (id_tarea,), fetch_one=True)
+    elif query.data == 'list_pending':
+        pending = execute_sql("SELECT id, description, operational_category FROM tasks WHERE status = 'Pending' ORDER BY calculated_date ASC LIMIT 8", fetch_all=True) or []
+        if not pending: return await query.edit_message_text("🎉 Everything is up to date.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='menu_task')]]))
+        keyboard = [[InlineKeyboardButton(f"{'🔁' if p[2]=='ROUTINE' else '✅'} {p[1][:25]}", callback_data=f'complete_t_{p[0]}')] for p in pending]
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='menu_task')])
+        await query.edit_message_text("Select to COMPLETE:", reply_markup=InlineKeyboardMarkup(keyboard))
+        
+    elif query.data.startswith('complete_t_'):
+        t_id = query.data.split('_')[2]
+        info = execute_sql("SELECT operational_category, original_date, calculated_date FROM tasks WHERE id = %s", (t_id,), fetch_one=True)
         if info:
-            if info[0] == 'RUTINA':
-                siguiente_fecha = calcular_siguiente_rutina(info[1], info[2])
-                ejecutar_sql("UPDATE tareas SET fecha_calculada = %s WHERE id = %s", (siguiente_fecha, id_tarea))
-                await query.edit_message_text(f"🔁 Rutina completada. Próxima: {siguiente_fecha}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú", callback_data='volver_inicio')]]))
+            if info[0] == 'ROUTINE':
+                next_date = calculate_next_routine(info[1], info[2])
+                execute_sql("UPDATE tasks SET calculated_date = %s WHERE id = %s", (next_date, t_id))
+                await query.edit_message_text(f"🔁 Routine completed. Next: {next_date}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data='back_home')]]))
             else:
-                ejecutar_sql("UPDATE tareas SET estado = 'Completada', fecha_completado = %s WHERE id = %s", (datetime.date.today().strftime('%Y-%m-%d'), id_tarea))
-                await query.edit_message_text("🎉 Tarea completada.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú", callback_data='volver_inicio')]]))
+                execute_sql("UPDATE tasks SET status = 'Completed', completed_date = %s WHERE id = %s", (datetime.date.today().strftime('%Y-%m-%d'), t_id))
+                log_audit("COMPLETE_TASK", f"Task ID {t_id} completed")
+                await query.edit_message_text("🎉 Task completed.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data='back_home')]]))
 
-    elif query.data == 'ver_calendario':
-        tareas = ejecutar_sql("SELECT descripcion, fecha_calculada, categoria_operativa FROM tareas WHERE estado = 'Pendiente'", fetch_all=True) or []
-        proximos_7 = [datetime.date.today() + datetime.timedelta(days=i) for i in range(7)]
-        dias_esp = {0: 'lunes', 1: 'martes', 2: 'miércoles', 3: 'jueves', 4: 'viernes', 5: 'sábado', 6: 'domingo'}
-        mensaje = "📅 *AGENDA:*\n\n"
-        for dia_d in proximos_7:
-            d_str = dia_d.strftime('%Y-%m-%d')
-            t_dia = [t for t in tareas if t[1] == d_str]
-            if t_dia: mensaje += f"🗓️ *{dias_esp[dia_d.weekday()].capitalize()}, {d_str}*\n" + "".join([f"   ├ ▫️ {t[0]}\n" for t in t_dia]) + "\n"
-        await query.edit_message_text(mensaje if "🗓️" in mensaje else "Tu agenda está al día.", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]))
+    elif query.data == 'view_calendar':
+        tasks = execute_sql("SELECT description, calculated_date, operational_category FROM tasks WHERE status = 'Pending'", fetch_all=True) or []
+        next_7 = [datetime.date.today() + datetime.timedelta(days=i) for i in range(7)]
+        days_eng = {0: 'Monday', 1: 'Tuesday', 2: 'Wednesday', 3: 'Thursday', 4: 'Friday', 5: 'Saturday', 6: 'Sunday'}
+        msg = "📅 *AGENDA (Next 7 Days):*\n\n"
+        for d in next_7:
+            d_str = d.strftime('%Y-%m-%d')
+            t_day = [t for t in tasks if t[1] == d_str]
+            if t_day: msg += f"🗓️ *{days_eng[d.weekday()]}, {d_str}*\n" + "".join([f"   ├ ▫️ {t[0]}\n" for t in t_day]) + "\n"
+        await query.edit_message_text(msg if "🗓️" in msg else "Your agenda is up to date.", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='back_home')]]))
 
-    # --- FINANZAS ---
-    elif query.data == 'menu_finanzas':
-        teclado = [
-            [InlineKeyboardButton("💸 Gasto Manual", callback_data='finanza_gasto'), InlineKeyboardButton("💵 Ingreso Manual", callback_data='finanza_ingreso')],
-            [InlineKeyboardButton("✅ Pagar Pendientes", callback_data='listar_pagos_pendientes')],
-            [InlineKeyboardButton("🧾 Pago de Servicios", callback_data='finanza_servicio')],
-            [InlineKeyboardButton("📊 Balance Mensual", callback_data='ver_balance_mes')],
-            [InlineKeyboardButton("⬇️ Exportar CSV", callback_data='exportar_csv'), InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]
+    # --- FINANCES MENU ---
+    elif query.data == 'menu_finance':
+        keyboard = [
+            [InlineKeyboardButton("💸 Manual Expense", callback_data='finance_expense'), InlineKeyboardButton("💵 Manual Income", callback_data='finance_income')],
+            [InlineKeyboardButton("✅ Pay Pending", callback_data='list_pending_payments')],
+            [InlineKeyboardButton("🧾 Pay Utility", callback_data='finance_utility')],
+            [InlineKeyboardButton("📊 Historic Balance", callback_data='view_balance_all'), InlineKeyboardButton("📅 Current Month", callback_data='view_balance_month')],
+            [InlineKeyboardButton("✏️ Edit / Delete", callback_data='edit_recent_f')],
+            [InlineKeyboardButton("⬇️ Export CSV", callback_data='export_csv'), InlineKeyboardButton("🔙 Back", callback_data='back_home')]
         ]
-        await query.edit_message_text("💰 *Finanzas:*", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(teclado))
+        await query.edit_message_text("💰 *Finances:*", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
         
-    elif query.data == 'listar_pagos_pendientes':
-        pagos = ejecutar_sql("SELECT id, concepto, monto, fecha, es_recordatorio FROM finanzas WHERE estado = 'Pendiente' ORDER BY fecha ASC LIMIT 8", fetch_all=True) or []
-        if not pagos: return await query.edit_message_text("🎉 Sin pendientes.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='menu_finanzas')]]))
-        hoy_str = datetime.date.today().strftime('%Y-%m-%d')
-        teclado = [[InlineKeyboardButton(f"{'🔴' if p[3] < hoy_str else '⏳'} {'Recordatorio' if p[4] else f'${p[2]:.0f}'}: {p[1][:12]}", callback_data=f'pagar_f_{p[0]}')] for p in pagos]
-        teclado.append([InlineKeyboardButton("🔙 Volver", callback_data='menu_finanzas')])
-        await query.edit_message_text("*(🔴 = Vencido)*", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(teclado))
+    elif query.data == 'export_csv':
+        await query.edit_message_text("⏳ Generating report...")
+        await command_export(update, context)
+
+    elif query.data == 'list_pending_payments':
+        payments = execute_sql("SELECT id, concept, amount, date, is_reminder FROM finances WHERE status = 'Pending' ORDER BY date ASC LIMIT 8", fetch_all=True) or []
+        if not payments: return await query.edit_message_text("🎉 No pending payments.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='menu_finance')]]))
+        today_str = datetime.date.today().strftime('%Y-%m-%d')
+        keyboard = [[InlineKeyboardButton(f"{'🔴' if p[3] < today_str else '⏳'} {'Reminder' if p[4] else f'${p[2]:.0f}'}: {p[1][:12]}", callback_data=f'pay_f_{p[0]}')] for p in payments]
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='menu_finance')])
+        await query.edit_message_text("*(🔴 = Overdue)*", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
         
-    elif query.data.startswith('pagar_f_'):
-        id_pago = query.data.split('_')[2]
-        info = ejecutar_sql("SELECT monto, tipo, cuenta, subcategoria, estado, es_recordatorio, concepto FROM finanzas WHERE id = %s", (id_pago,), fetch_one=True)
-        if info and info[4] == 'Pendiente':
+    elif query.data.startswith('pay_f_'):
+        p_id = query.data.split('_')[2]
+        info = execute_sql("SELECT amount, type, account, subcategory, status, is_reminder, concept FROM finances WHERE id = %s", (p_id,), fetch_one=True)
+        if info and info[4] == 'Pending':
             if info[5]: 
-                ejecutar_sql("DELETE FROM finanzas WHERE id = %s", (id_pago,))
-                await query.edit_message_text(f"🔔 Borré el recordatorio sin monto.\nPara pagarlo, dictame el importe exacto.", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú", callback_data='volver_inicio')]]))
+                execute_sql("DELETE FROM finances WHERE id = %s", (p_id,))
+                await query.edit_message_text(f"🔔 Reminder deleted.\nTo pay it, send me the exact amount.", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data='back_home')]]))
             else:
-                ejecutar_sql("UPDATE finanzas SET estado = 'Completado', fecha = %s WHERE id = %s", (datetime.date.today().strftime('%Y-%m-%d'), id_pago))
-                registrar_operacion('finanzas', id_pago, 'PAGO_REALIZADO')
-                alerta = procesar_impacto_financiero(info[0], info[1], info[2], info[3], 'Completado')
-                await query.edit_message_text(f"💸 Pago realizado.{alerta}", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menú", callback_data='volver_inicio')]]))
+                execute_sql("UPDATE finances SET status = 'Completed', date = %s WHERE id = %s", (datetime.date.today().strftime('%Y-%m-%d'), p_id))
+                log_operation('finances', p_id, 'PAYMENT_MADE')
+                log_audit("PAYMENT_MADE", f"Finance ID {p_id} paid")
+                alert = process_financial_impact(info[0], info[1], info[2], info[3], 'Completed')
+                await query.edit_message_text(f"💸 Payment completed.{alert}", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data='back_home')]]))
 
-    elif query.data.startswith('ver_balance_'):
-        mes_actual = datetime.datetime.now().strftime('%Y-%m')
-        registros = ejecutar_sql("SELECT tipo, area, monto, concepto, fecha, estado, subcategoria, es_recordatorio FROM finanzas WHERE fecha LIKE %s ORDER BY fecha ASC", (f"{mes_actual}-%",), fetch_all=True) or []
-        ing_emp = gas_emp = ing_per = gas_per = 0
-        for r in registros:
-            if r[5] == 'Completado' and not r[7]: 
-                if r[0] == 'Ingreso' and r[1] == 'Empresa': ing_emp += r[2]
-                elif r[0] == 'Gasto' and r[1] == 'Empresa': gas_emp += r[2]
-                elif r[0] == 'Ingreso' and r[1] == 'Personal': ing_per += r[2]
-                elif r[0] == 'Gasto' and r[1] == 'Personal': gas_per += r[2]
-                
-        mensaje = f"📊 *BALANCE DEL MES*\n\n🏢 *EMPRESA:*\n   ├ 📈 In: ${ing_emp:,.2f} | 📉 Out: ${gas_emp:,.2f}\n   └ ⚖️ Balance: ${(ing_emp - gas_emp):,.2f}\n\n👤 *PERSONAL:*\n   ├ 📈 In: ${ing_per:,.2f} | 📉 Out: ${gas_per:,.2f}\n   └ ⚖️ Balance: ${(ing_per - gas_per):,.2f}\n\n"
-        cuentas_res = ejecutar_sql("SELECT nombre, saldo FROM config_cuentas WHERE saldo != 0", fetch_all=True) or []
-        if cuentas_res: mensaje += "💰 *Saldos Actuales:*\n" + "".join([f"   ▫️ {c[0]}: ${c[1]:,.2f}\n" for c in cuentas_res])
-        await query.edit_message_text(mensaje, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='menu_finanzas')]]))
-
-    elif query.data.startswith('aprender_'):
-        categoria = "Empresa" if query.data == 'aprender_empresa' else "Personal"
-        datos = context.user_data.get('pendiente_clasificar')
-        if datos:
-            palabra = obtener_palabra_aprendizaje(datos.get('palabra_clave') or datos.get('concepto') or datos.get('descripcion'))
-            if palabra:
-                ejecutar_sql("INSERT INTO diccionario (palabra, categoria) VALUES (%s, %s) ON CONFLICT DO NOTHING", (palabra.upper(), categoria))
-                recargar_cache()
-                datos['area' if datos.get('tipo_registro') == 'finanza' else 'tipo'] = categoria
-                await guardar_datos_nlp(context.bot, MI_TELEGRAM_ID, datos, context)
-            else: await query.edit_message_text("⚠️ Palabra inválida.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]))
-            context.user_data.pop('pendiente_clasificar', None)
+    elif query.data.startswith('view_balance_'):
+        filter_type = query.data.split('_')[2]
+        today_str = datetime.date.today().strftime('%Y-%m-%d')
+        if filter_type == 'month':
+            curr_month = datetime.datetime.now().strftime('%Y-%m')
+            records = execute_sql("SELECT type, area, amount, concept, date, status FROM finances WHERE date LIKE %s ORDER BY date ASC", (f"{curr_month}-%",), fetch_all=True) or []
+            title = f"📊 *MONTHLY BALANCE ({curr_month})*\n\n"
+        else:
+            records = execute_sql("SELECT type, area, amount, concept, date, status FROM finances ORDER BY date ASC", fetch_all=True) or []
+            title = "📊 *HISTORICAL BALANCE*\n\n"
             
-    elif query.data == 'modo_enfoque':
-        teclado = [[InlineKeyboardButton("25m", callback_data='start_enfoque_25'), InlineKeyboardButton("45m", callback_data='start_enfoque_45'), InlineKeyboardButton("60m", callback_data='start_enfoque_60')], [InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]
-        await query.edit_message_text("⏱️ *Modo Enfoque*\nElige el tiempo:", reply_markup=InlineKeyboardMarkup(teclado), parse_mode='Markdown')
-    elif query.data.startswith('start_enfoque_'):
-        minutos = int(query.data.split('_')[2])
-        await query.edit_message_text(f"⏱️ *Enfoque activo: {minutos} minutos.*\n¡A trabajar!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏹️ Finalizar", callback_data='cancelar_enfoque')]]), parse_mode='Markdown')
+        in_biz = out_biz = in_per = out_per = 0
+        pending_list, exp_list = [], []
+        
+        for r in records:
+            if r[5] == 'Pending': pending_list.append(r)
+            else: 
+                if r[0] == 'Income' and r[1] == 'Business': in_biz += r[2]
+                elif r[0] == 'Expense' and r[1] == 'Business': out_biz += r[2]
+                elif r[0] == 'Income' and r[1] == 'Personal': in_per += r[2]
+                elif r[0] == 'Expense' and r[1] == 'Personal': out_per += r[2]
+                if r[0] == 'Expense': exp_list.append(r)
+                
+        msg = title + f"🏢 *BUSINESS:*\n   ├ 📈 In: ${in_biz:,.2f} | 📉 Out: ${out_biz:,.2f}\n   └ ⚖️ Balance: ${(in_biz - out_biz):,.2f}\n\n"
+        msg += f"👤 *PERSONAL:*\n   ├ 📈 In: ${in_per:,.2f} | 📉 Out: ${out_per:,.2f}\n   └ ⚖️ Balance: ${(in_per - out_per):,.2f}\n\n"
+        
+        acc_res = execute_sql("SELECT name, balance FROM config_accounts WHERE balance != 0", fetch_all=True) or []
+        if acc_res: msg += "💰 *Current Balances:*\n" + "".join([f"   ▫️ {c[0]}: ${c[1]:,.2f}\n" for c in acc_res])
+                
+        await query.edit_message_text(msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='menu_finance')]]))
+
+    elif query.data.startswith('learn_'):
+        category = "Business" if query.data == 'learn_business' else "Personal"
+        data = context.user_data.get('pending_classification')
+        if data:
+            word = get_learning_word(data.get('keyword') or data.get('concept') or data.get('description'))
+            if word:
+                execute_sql("INSERT INTO dictionary (word, category) VALUES (%s, %s) ON CONFLICT DO NOTHING", (word.upper(), category))
+                reload_cache()
+                data['area' if data.get('record_type') == 'finance' else 'type'] = category
+                await save_nlp_data(context.bot, MY_TELEGRAM_ID, data, context)
+            else: await query.edit_message_text("⚠️ Invalid word.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='back_home')]]))
+            context.user_data.pop('pending_classification', None)
+            
+    elif query.data == 'focus_mode':
+        keyboard = [[InlineKeyboardButton("25m", callback_data='start_focus_25'), InlineKeyboardButton("45m", callback_data='start_focus_45'), InlineKeyboardButton("60m", callback_data='start_focus_60')], [InlineKeyboardButton("🔙 Back", callback_data='back_home')]]
+        await query.edit_message_text("⏱️ *Focus Mode*\nChoose time:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    elif query.data.startswith('start_focus_'):
+        minutes = int(query.data.split('_')[2])
+        await query.edit_message_text(f"⏱️ *Focus active: {minutes} minutes.*\nGet to work!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏹️ End", callback_data='cancel_focus')]]), parse_mode='Markdown')
         async def temp():
-            await asyncio.sleep(minutos * 60)
-            await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=f"🔔 *¡TIEMPO CUMPLIDO ({minutos} min)!* Descansa.", parse_mode='Markdown')
-        context.user_data['tarea_enfoque'] = asyncio.create_task(temp())
-    elif query.data == 'cancelar_enfoque':
-        if 'tarea_enfoque' in context.user_data: context.user_data['tarea_enfoque'].cancel()
-        await query.edit_message_text("⏹️ *Enfoque detenido.*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data='volver_inicio')]]))
+            await asyncio.sleep(minutes * 60)
+            await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=f"🔔 *TIME UP ({minutes} min)!* Take a break.", parse_mode='Markdown')
+        context.user_data['focus_task'] = asyncio.create_task(temp())
+    elif query.data == 'cancel_focus':
+        if 'focus_task' in context.user_data: context.user_data['focus_task'].cancel()
+        await query.edit_message_text("⏹️ *Focus stopped.*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='back_home')]]))
     
-    elif query.data == 'exportar_csv':
-        await query.edit_message_text("⏳ Generando reporte...")
-        await generar_y_enviar_backup(context)
+    # --- DELETE & UI CLEANUP ---
+    elif query.data == 'edit_recent_f':
+        fins = execute_sql("SELECT id, concept, amount FROM finances ORDER BY id DESC LIMIT 5", fetch_all=True) or []
+        keyboard = [[InlineKeyboardButton(f"❌ Del {f[1][:10]} (${f[2]:.0f})", callback_data=f"del_f_{f[0]}"), InlineKeyboardButton("✏️ Edit", callback_data=f"edit_f_{f[0]}")] for f in fins]
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='menu_finance')])
+        await query.edit_message_text("Select the action for the recent financial records:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif query.data.startswith('del_f_'):
+        del_id = query.data.split('_')[2]
+        info = execute_sql("SELECT type, amount, account, status FROM finances WHERE id = %s", (del_id,), fetch_one=True)
+        if info and info[3] == 'Completed':
+            op = "-" if info[0] == "Income" else "+"
+            execute_sql(f"UPDATE config_accounts SET balance = balance {op} %s WHERE LOWER(name) = %s", (info[1], info[2].lower()))
+        execute_sql("DELETE FROM finances WHERE id = %s", (del_id,))
+        await query.edit_message_text(f"✅ Financial record #{del_id} permanently deleted.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='menu_finance')]]))
         
-    elif query.data == 'volver_inicio':
-        await query.edit_message_text("Menú Principal:", reply_markup=obtener_menu_principal())
+    elif query.data == 'back_home':
+        await query.edit_message_text("Main Menu:", reply_markup=get_main_menu())
 
 # ==========================================
-# 10. REGISTROS MANUALES
+# 9. MANUAL REGISTRATION
 # ==========================================
-async def cancelar_registro(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Cancelado.", reply_markup=obtener_menu_principal())
+async def cancel_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Cancelled.", reply_markup=get_main_menu())
     return ConversationHandler.END
 
-# ---- HÁBITOS ----
-async def iniciar_registro_habito(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+# ---- HABITS MANUAL ----
+async def start_habit_registration(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     await u.callback_query.answer()
-    await u.callback_query.edit_message_text("🧘 *Escribe el nombre del nuevo hábito*:", parse_mode='Markdown')
-    return H_NOMBRE
+    await u.callback_query.edit_message_text("🧘 *Type the name of the new habit*\n(e.g., 'Go to gym', 'Read 15 mins'):", parse_mode='Markdown')
+    return H_NAME
 
-async def capturar_habito(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
-    ejecutar_sql("INSERT INTO habitos (nombre, racha, ultima_fecha) VALUES (%s, 0, '')", (u.message.text,))
-    await u.message.reply_text(f"✅ Hábito '{u.message.text}' creado. ¡Mucho éxito!", reply_markup=obtener_menu_principal())
+async def capture_habit(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+    name = u.message.text
+    execute_sql("INSERT INTO habits (name, streak, last_date) VALUES (%s, 0, '')", (name,))
+    await u.message.reply_text(f"✅ Habit '{name}' created. Good luck!", reply_markup=get_main_menu())
     return ConversationHandler.END
 
-# ---- SERVICIOS (UTILITIES) ----
-async def iniciar_servicio(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+# ---- TASKS MANUAL ----
+async def start_task_registration(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     await u.callback_query.answer()
-    c.user_data['nuevo_servicio'] = {}
-    await u.callback_query.edit_message_text("🧾 *Servicios / Utilities*\nEscribe el concepto (Ej. 'Luz', 'Internet'):", parse_mode='Markdown')
-    return S_CONCEPTO
-
-async def capturar_s_concepto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
-    c.user_data['nuevo_servicio']['concepto'] = u.message.text
-    await u.message.reply_text("💵 *Monto del servicio (número):*", parse_mode='Markdown')
-    return S_MONTO
-
-async def capturar_s_monto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
-    try: c.user_data['nuevo_servicio']['monto'] = float(u.message.text.replace('$', '').replace(',', ''))
-    except ValueError:
-        await u.message.reply_text("⚠️ Solo ingresa números.")
-        return S_MONTO
-    await u.message.reply_text("📅 *Fecha (Ej. 'hoy', 'mañana', '15 de dic'):*", parse_mode='Markdown')
-    return S_FECHA
-
-async def capturar_s_fecha(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
-    srv = c.user_data['nuevo_servicio']
-    fc = dateparser.parse(u.message.text, languages=['es'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'America/Monterrey'})
-    ff = fc.strftime('%Y-%m-%d') if fc else datetime.date.today().strftime('%Y-%m-%d')
-    est = 'Pendiente' if ff > datetime.date.today().strftime('%Y-%m-%d') else 'Completado'
-    
-    ejecutar_sql("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha, categoria, estado, subcategoria, cuenta, es_recordatorio) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                ('Gasto', 'Desconocida', srv['concepto'], srv['monto'], 'Efectivo', ff, 'General', est, 'Servicios', 'Efectivo', False))
-    if est == 'Completado':
-        ejecutar_sql("UPDATE config_cuentas SET saldo = saldo - %s WHERE LOWER(nombre) = 'efectivo'", (srv['monto'],))
-        
-    await u.message.reply_text(f"🧾 *Servicio Registrado*\n🏷️ {srv['concepto']}\n💲 ${srv['monto']:,.2f}\n📅 {ff} ({est})", parse_mode='Markdown', reply_markup=obtener_menu_principal())
+    c.user_data['new_task'] = {}
+    await u.callback_query.edit_message_text("📝 *Description:*", parse_mode='Markdown')
+    return T_DESCRIPTION
+async def capture_description(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+    c.user_data['new_task']['description'] = u.message.text
+    await u.message.reply_text("📂 *Category:*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Business", callback_data='typ_bus'), InlineKeyboardButton("Personal", callback_data='typ_per')]]), parse_mode='Markdown')
+    return T_TYPE
+async def capture_type(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+    await u.callback_query.answer()
+    c.user_data['new_task']['type'] = "Business" if u.callback_query.data == 'typ_bus' else "Personal"
+    await u.callback_query.edit_message_text("⚡ *Priority:*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Urgent", callback_data='prio_urg'), InlineKeyboardButton("Routine", callback_data='prio_rout')]]), parse_mode='Markdown')
+    return T_PRIORITY
+async def capture_priority(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+    await u.callback_query.answer()
+    c.user_data['new_task']['priority'] = "Urgent" if u.callback_query.data == 'prio_urg' else "Routine"
+    await u.callback_query.edit_message_text("📅 *Date:*", parse_mode='Markdown')
+    return T_DATE
+async def capture_date(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+    f_calc = dateparser.parse(u.message.text, languages=['en'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'America/Monterrey'})
+    c.user_data['new_task']['original_date'] = u.message.text
+    c.user_data['new_task']['calculated_date'] = f_calc.strftime('%Y-%m-%d') if f_calc else "Recurring"
+    await u.message.reply_text("🗒️ *Notes:*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Skip", callback_data='no_notes')]]), parse_mode='Markdown')
+    return T_NOTES
+async def capture_notes(u: Update, cx: ContextTypes.DEFAULT_TYPE) -> int:
+    task = cx.user_data['new_task']
+    cat_op = "ROUTINE" if task['priority'] == "Routine" else "TASK"
+    res = execute_sql("INSERT INTO tasks (description, type, priority, original_date, calculated_date, notes, status, operational_category) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+              (task['description'], task['type'], task['priority'], task['original_date'], task['calculated_date'], "None" if u.callback_query else u.message.text, 'Pending', cat_op), fetch_one=True)
+    if res: log_operation('tasks', res[0], 'INSERT')
+    msg = MSG_SUCCESS_TASK.format(cat_op=cat_op, desc=task['description'], date=task['calculated_date'], area=task['type'])
+    await (u.callback_query.edit_message_text if u.callback_query else u.message.reply_text)(msg, parse_mode='Markdown', reply_markup=get_main_menu())
     return ConversationHandler.END
 
-# ---- TAREAS ----
-async def iniciar_registro_tarea(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+# ---- FINANCES MANUAL ----
+async def start_finance(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     await u.callback_query.answer()
-    c.user_data['nueva_tarea'] = {}
-    await u.callback_query.edit_message_text("📝 *Descripción:*", parse_mode='Markdown')
-    return T_DESCRIPCION
-async def capturar_descripcion(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
-    c.user_data['nueva_tarea']['descripcion'] = u.message.text
-    await u.message.reply_text("📂 *Categoría:*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Empresa", callback_data='tipo_empresa'), InlineKeyboardButton("Personal", callback_data='tipo_personal')]]), parse_mode='Markdown')
-    return T_TIPO
-async def capturar_tipo(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
-    await u.callback_query.answer()
-    c.user_data['nueva_tarea']['tipo'] = "Empresa" if u.callback_query.data == 'tipo_empresa' else "Personal"
-    await u.callback_query.edit_message_text("⚡ *Prioridad:*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Urgente", callback_data='prio_urgente'), InlineKeyboardButton("Rutina", callback_data='prio_rutina')]]), parse_mode='Markdown')
-    return T_PRIORIDAD
-async def capturar_prioridad(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
-    await u.callback_query.answer()
-    c.user_data['nueva_tarea']['prioridad'] = "Urgente" if u.callback_query.data == 'prio_urgente' else "Rutina"
-    await u.callback_query.edit_message_text("📅 *Fecha:*", parse_mode='Markdown')
-    return T_FECHA
-async def capturar_fecha(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
-    f_calc = dateparser.parse(u.message.text, languages=['es'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'America/Monterrey'})
-    c.user_data['nueva_tarea']['fecha_original'] = u.message.text
-    c.user_data['nueva_tarea']['fecha_calculada'] = f_calc.strftime('%Y-%m-%d') if f_calc else "Recurrente"
-    await u.message.reply_text("🗒️ *Notas:*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Saltar", callback_data='sin_notas')]]), parse_mode='Markdown')
-    return T_NOTAS
-async def capturar_notas(u: Update, cx: ContextTypes.DEFAULT_TYPE) -> int:
-    tarea = cx.user_data['nueva_tarea']
-    cat_op = "RUTINA" if tarea['prioridad'] == "Rutina" else "TAREA"
-    res = ejecutar_sql("INSERT INTO tareas (descripcion, tipo, prioridad, fecha_original, fecha_calculada, notas, estado, categoria_operativa) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-              (tarea['descripcion'], tarea['tipo'], tarea['prioridad'], tarea['fecha_original'], tarea['fecha_calculada'], "Ninguna" if u.callback_query else u.message.text, 'Pendiente', cat_op), fetch_one=True)
-    if res: registrar_operacion('tareas', res[0], 'INSERT')
-    msg = MSG_EXITO_TAREA.format(cat_op=cat_op, desc=tarea['descripcion'], fecha=tarea['fecha_calculada'], area=tarea['tipo'])
-    await (u.callback_query.edit_message_text if u.callback_query else u.message.reply_text)(msg, parse_mode='Markdown', reply_markup=obtener_menu_principal())
-    return ConversationHandler.END
-
-# ---- FINANZAS ----
-async def iniciar_finanzas(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
-    await u.callback_query.answer()
-    c.user_data['nueva_finanza'] = {'tipo': "Gasto" if u.callback_query.data == 'finanza_gasto' else "Ingreso"}
-    await u.callback_query.edit_message_text("💰 *¿Empresa o Personal?*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Empresa", callback_data='f_empresa'), InlineKeyboardButton("Personal", callback_data='f_personal')]]), parse_mode='Markdown')
+    c.user_data['new_finance'] = {'type': "Expense" if u.callback_query.data == 'finance_expense' else "Income"}
+    await u.callback_query.edit_message_text("💰 *Business or Personal?*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Business", callback_data='f_bus'), InlineKeyboardButton("Personal", callback_data='f_per')]]), parse_mode='Markdown')
     return F_AREA
-async def capturar_f_area(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+async def capture_f_area(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     await u.callback_query.answer()
-    c.user_data['nueva_finanza']['area'] = "Empresa" if u.callback_query.data == 'f_empresa' else "Personal"
-    await u.callback_query.edit_message_text("📝 *Concepto:*", parse_mode='Markdown')
-    return F_CONCEPTO
-async def capturar_f_concepto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
-    c.user_data['nueva_finanza']['concepto'] = u.message.text
-    await u.message.reply_text("💵 *Monto numérico:*", parse_mode='Markdown')
-    return F_MONTO
-async def capturar_f_monto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
-    try: c.user_data['nueva_finanza']['monto'] = float(u.message.text)
+    c.user_data['new_finance']['area'] = "Business" if u.callback_query.data == 'f_bus' else "Personal"
+    await u.callback_query.edit_message_text("📝 *Concept:*", parse_mode='Markdown')
+    return F_CONCEPT
+async def capture_f_concept(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+    c.user_data['new_finance']['concept'] = u.message.text
+    await u.message.reply_text("💵 *Numeric amount:*", parse_mode='Markdown')
+    return F_AMOUNT
+async def capture_f_amount(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+    try: c.user_data['new_finance']['amount'] = float(u.message.text)
     except ValueError:
-        await u.message.reply_text("⚠️ Solo números:")
-        return F_MONTO 
-    if c.user_data['nueva_finanza']['tipo'] == "Gasto":
-        teclado, cuentas = [], list(CACHE_CUENTAS.values())
-        for i in range(0, len(cuentas), 2): teclado.append([InlineKeyboardButton(cta, callback_data=f'f_cta_{cta}') for cta in cuentas[i:i+2]])
-        await u.message.reply_text("💳 *Cuenta:*", reply_markup=InlineKeyboardMarkup(teclado), parse_mode='Markdown')
-        return F_METODO
-    c.user_data['nueva_finanza']['metodo'] = "N/A"
-    await u.message.reply_text("📅 *Fecha:*", parse_mode='Markdown')
-    return F_FECHA
-async def capturar_f_metodo(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+        await u.message.reply_text("⚠️ Numbers only:")
+        return F_AMOUNT 
+    if c.user_data['new_finance']['type'] == "Expense":
+        keyboard, accs = [], list(CACHE_ACCOUNTS.values())
+        for i in range(0, len(accs), 2): keyboard.append([InlineKeyboardButton(acc, callback_data=f'f_acc_{acc}') for acc in accs[i:i+2]])
+        await u.message.reply_text("💳 *Account:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        return F_METHOD
+    c.user_data['new_finance']['method'] = "N/A"
+    await u.message.reply_text("📅 *Date:*", parse_mode='Markdown')
+    return F_DATE
+async def capture_f_method(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     await u.callback_query.answer()
-    c.user_data['nueva_finanza']['metodo'] = u.callback_query.data.replace('f_cta_', '')
-    await u.callback_query.edit_message_text("📅 *Fecha:*", parse_mode='Markdown')
-    return F_FECHA
-async def capturar_f_fecha(u: Update, cx: ContextTypes.DEFAULT_TYPE) -> int:
-    f = cx.user_data['nueva_finanza']
-    fc = dateparser.parse(u.message.text, languages=['es'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'America/Monterrey'})
+    c.user_data['new_finance']['method'] = u.callback_query.data.replace('f_acc_', '')
+    await u.callback_query.edit_message_text("📅 *Date:*", parse_mode='Markdown')
+    return F_DATE
+async def capture_f_date(u: Update, cx: ContextTypes.DEFAULT_TYPE) -> int:
+    f = cx.user_data['new_finance']
+    fc = dateparser.parse(u.message.text, languages=['en'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'America/Monterrey'})
     ff = fc.strftime('%Y-%m-%d') if fc else datetime.datetime.now().strftime('%Y-%m-%d')
-    est = 'Pendiente' if ff > datetime.datetime.now().strftime('%Y-%m-%d') else 'Completado'
-    res = ejecutar_sql("INSERT INTO finanzas (tipo, area, concepto, monto, metodo, fecha, categoria, estado, subcategoria, cuenta, es_recordatorio) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id", 
-                (f['tipo'], f['area'], f['concepto'], f['monto'], f['metodo'], ff, 'General', est, 'General', f['metodo'], False), fetch_one=True)
-    if res: registrar_operacion('finanzas', res[0], 'INSERT')
-    alerta = procesar_impacto_financiero(f['monto'], f['tipo'], f['metodo'], 'General', est)
-    msg = MSG_EXITO_FINANZA.format(concepto=f['concepto'].title(), monto=f['monto'], cat="General", cuenta=f['metodo'], fecha=ff, estado="⏳ Pendiente" if est == 'Pendiente' else "✅ Completado", alerta=alerta)
-    await u.message.reply_text(msg, parse_mode='Markdown', reply_markup=obtener_menu_principal())
+    est = 'Pending' if ff > datetime.datetime.now().strftime('%Y-%m-%d') else 'Completed'
+    res = execute_sql("INSERT INTO finances (type, area, concept, amount, method, date, category, status, subcategory, account, is_reminder) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id", 
+                (f['type'], f['area'], f['concept'], f['amount'], f['method'], ff, 'General', est, 'General', f['method'], False), fetch_one=True)
+    if res: log_operation('finances', res[0], 'INSERT')
+    alert = process_financial_impact(f['amount'], f['type'], f['method'], 'General', est)
+    msg = MSG_SUCCESS_FINANCE.format(concept=f['concept'].title(), amount=f['amount'], cat="General", account=f['method'], date=ff, status="⏳ Pending" if est == 'Pending' else "✅ Completed", alert=alert)
+    await u.message.reply_text(msg, parse_mode='Markdown', reply_markup=get_main_menu())
+    return ConversationHandler.END
+
+# ---- UTILITIES MANUAL ----
+async def start_utility(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+    await u.callback_query.answer()
+    c.user_data['new_utility'] = {}
+    await u.callback_query.edit_message_text("🧾 *Utilities / Services*\nType the concept (e.g. 'Electric bill', 'Internet'):", parse_mode='Markdown')
+    return S_CONCEPT
+
+async def capture_s_concept(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+    c.user_data['new_utility']['concept'] = u.message.text
+    await u.message.reply_text("💵 *Utility amount (number):*", parse_mode='Markdown')
+    return S_AMOUNT
+
+async def capture_s_amount(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+    try: 
+        c.user_data['new_utility']['amount'] = float(u.message.text.replace('$', '').replace(',', ''))
+    except ValueError:
+        await u.message.reply_text("⚠️ Numbers only.")
+        return S_AMOUNT
+    await u.message.reply_text("📅 *Date (e.g. 'today', 'tomorrow', 'Dec 15'):*", parse_mode='Markdown')
+    return S_DATE
+
+async def capture_s_date(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+    srv = c.user_data['new_utility']
+    fc = dateparser.parse(u.message.text, languages=['en'], settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'America/Monterrey'})
+    ff = fc.strftime('%Y-%m-%d') if fc else datetime.date.today().strftime('%Y-%m-%d')
+    est = 'Pending' if ff > datetime.date.today().strftime('%Y-%m-%d') else 'Completed'
+    
+    execute_sql("INSERT INTO finances (type, area, concept, amount, method, date, category, status, subcategory, account, is_reminder) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                ('Expense', 'Unknown', srv['concept'], srv['amount'], 'Cash', ff, 'General', est, 'Utilities', 'Cash', False))
+    if est == 'Completed':
+        execute_sql("UPDATE config_accounts SET balance = balance - %s WHERE LOWER(name) = 'cash'", (srv['amount'],))
+        
+    await u.message.reply_text(f"🧾 *Utility Registered*\n🏷️ {srv['concept']}\n💲 ${srv['amount']:,.2f}\n📅 {ff} ({est})", parse_mode='Markdown', reply_markup=get_main_menu())
     return ConversationHandler.END
 
 # ==========================================
-# 11. ALERTAS Y RESUMEN
+# 10. ALERTS & SCHEDULING
 # ==========================================
-async def alerta_matutina(context: ContextTypes.DEFAULT_TYPE):
-    hoy = datetime.date.today()
-    ayer = (hoy - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
-    hoy_str = hoy.strftime('%Y-%m-%d')
+async def morning_alert(context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.date.today()
+    yesterday = (today - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+    today_str = today.strftime('%Y-%m-%d')
 
-    gastos_ayer = ejecutar_sql("SELECT SUM(monto) FROM finanzas WHERE fecha = %s AND tipo = 'Gasto' AND estado = 'Completado'", (ayer,), fetch_one=True)[0] or 0
-    tareas_ayer = ejecutar_sql("SELECT COUNT(*) FROM tareas WHERE fecha_completado = %s", (ayer,), fetch_one=True)[0] or 0
-    tareas_hoy = ejecutar_sql("SELECT descripcion, prioridad FROM tareas WHERE fecha_calculada <= %s AND estado = 'Pendiente'", (hoy_str,), fetch_all=True) or []
-    pagos = ejecutar_sql("SELECT concepto, monto, fecha, es_recordatorio FROM finanzas WHERE fecha <= %s AND estado = 'Pendiente'", (hoy_str,), fetch_all=True) or []
-    habitos_hoy = ejecutar_sql("SELECT nombre, ultima_fecha FROM habitos", fetch_all=True) or []
+    exp_yest = execute_sql("SELECT SUM(amount) FROM finances WHERE date = %s AND type = 'Expense' AND status = 'Completed'", (yesterday,), fetch_one=True)[0] or 0
+    task_yest = execute_sql("SELECT COUNT(*) FROM tasks WHERE completed_date = %s", (yesterday,), fetch_one=True)[0] or 0
+    tasks_today = execute_sql("SELECT description, type FROM tasks WHERE calculated_date <= %s AND status = 'Pending'", (today_str,), fetch_all=True) or []
+    habits_today = execute_sql("SELECT name, last_date FROM habits", fetch_all=True) or []
+    payments = execute_sql("SELECT concept, amount, date FROM finances WHERE date <= %s AND status = 'Pending'", (today_str,), fetch_all=True) or []
 
-    mensaje = f"☀️ *Resumen Ejecutivo Matutino*\n\n📊 *Desempeño de Ayer:*\n   ▫️ Tareas Completadas: {tareas_ayer}\n   ▫️ Gastos Realizados: ${gastos_ayer:,.2f}\n\n"
+    msg = f"☀️ *Morning Executive Brief*\n\n"
+    msg += f"📊 *Yesterday's Performance:*\n   ▫️ Tasks Completed: {task_yest}\n   ▫️ Total Spent: ${exp_yest:,.2f}\n\n"
     
-    if tareas_hoy:
-        mensaje += f"🎯 *Agenda de Hoy ({len(tareas_hoy)} pendientes):*\n"
-        for t in tareas_hoy: mensaje += f"   ▫️ {t[0]}\n"
+    if tasks_today:
+        msg += f"🎯 *Today's Agenda ({len(tasks_today)} pending):*\n"
+        for t in tasks_today: msg += f"   ▫️ {t[0]}\n"
     else:
-        mensaje += f"🎯 *Agenda de Hoy:*\n   ▫️ Todo libre.\n"
-        
-    if pagos:
-        mensaje += "\n🚨 *Vencimientos de hoy:*\n" + "".join([f"   {'🔴' if p[2] < hoy_str else '🔔'} {p[0]} ({'Recordatorio' if p[3] else f'${p[1]:,.2f}'})\n" for p in pagos])
+        msg += f"🎯 *Today's Agenda:*\n   ▫️ Clear, no pending tasks.\n"
 
-    habitos_pendientes = [h[0] for h in habitos_hoy if h[1] != hoy_str]
-    if habitos_pendientes:
-        mensaje += f"\n🧘 *Hábitos pendientes de hoy:*\n"
-        for h in habitos_pendientes: mensaje += f"   ▫️ {h}\n"
+    pending_habits = [h[0] for h in habits_today if h[1] != today_str]
+    if pending_habits:
+        msg += f"\n🧘 *Habits to complete today:*\n"
+        for h in pending_habits: msg += f"   ▫️ {h}\n"
 
-    await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=mensaje, parse_mode='Markdown', reply_markup=obtener_menu_principal())
+    if payments:
+        msg += "\n🚨 *Due today:*\n" + "".join([f"   {'🔴' if p[2] < today_str else '🔔'} {p[0]} (${p[1]:,.2f})\n" for p in payments])
 
-async def alerta_nocturna(context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text="🌙 *Corte de caja.* Revisa pendientes, completa tus hábitos y descansa.", parse_mode='Markdown', reply_markup=obtener_menu_principal())
+    await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=msg, parse_mode='Markdown', reply_markup=get_main_menu())
 
-async def alerta_semanal(context: ContextTypes.DEFAULT_TYPE):
-    hace_7, hoy_str = (datetime.date.today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d'), datetime.date.today().strftime('%Y-%m-%d')
-    creadas = (ejecutar_sql("SELECT COUNT(*) FROM tareas WHERE fecha_calculada BETWEEN %s AND %s", (hace_7, hoy_str), fetch_one=True) or [0])[0]
-    comp = (ejecutar_sql("SELECT COUNT(*) FROM tareas WHERE fecha_completado BETWEEN %s AND %s", (hace_7, hoy_str), fetch_one=True) or [0])[0]
-    fins = ejecutar_sql("SELECT tipo, monto FROM finanzas WHERE fecha BETWEEN %s AND %s AND estado = 'Completado' AND es_recordatorio = FALSE", (hace_7, hoy_str), fetch_all=True) or []
-    ing, gas = sum(f[1] for f in fins if f[0] == 'Ingreso'), sum(f[1] for f in fins if f[0] == 'Gasto')
-    mensaje = f"📅 *CORTE SEMANAL*\n\n📝 *Productividad:*\n   ├ Nuevas: {creadas}\n   └ ✅ Terminadas: {comp}\n\n💰 *Finanzas:*\n   ├ 📈 In: ${ing:,.2f} | 📉 Out: ${gas:,.2f}\n   └ ⚖️ Balance: ${(ing - gas):,.2f}\n"
-    await context.bot.send_message(chat_id=MI_TELEGRAM_ID, text=mensaje, parse_mode='Markdown')
-    await generar_y_enviar_backup(context)
+async def night_alert(context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text="🌙 *End of day.* Check your pending items, complete your habits, and get some rest.", parse_mode='Markdown', reply_markup=get_main_menu())
+
+async def weekly_alert(context: ContextTypes.DEFAULT_TYPE):
+    past_7, today_str = (datetime.date.today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d'), datetime.date.today().strftime('%Y-%m-%d')
+    created = (execute_sql("SELECT COUNT(*) FROM tasks WHERE calculated_date BETWEEN %s AND %s", (past_7, today_str), fetch_one=True) or [0])[0]
+    completed = (execute_sql("SELECT COUNT(*) FROM tasks WHERE completed_date BETWEEN %s AND %s", (past_7, today_str), fetch_one=True) or [0])[0]
+    fins = execute_sql("SELECT type, amount FROM finances WHERE date BETWEEN %s AND %s AND status = 'Completed' AND is_reminder = FALSE", (past_7, today_str), fetch_all=True) or []
+    inc, exp = sum(f[1] for f in fins if f[0] == 'Income'), sum(f[1] for f in fins if f[0] == 'Expense')
+    msg = f"📅 *WEEKLY SUMMARY*\n\n📝 *Productivity:*\n   ├ New: {created}\n   └ ✅ Completed: {completed}\n\n💰 *Finances:*\n   ├ 📈 In: ${inc:,.2f} | 📉 Out: ${exp:,.2f}\n   └ ⚖️ Balance: ${(inc - exp):,.2f}\n"
+    await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=msg, parse_mode='Markdown')
+    await generate_and_send_backup(context)
 
 # ==========================================
-# 12. ARRANQUE
+# 11. BOT STARTUP
 # ==========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_user.id not in ALLOWED_USERS: return
-    await update.message.reply_text("¡Hola! Háblame o usa el menú:", reply_markup=obtener_menu_principal())
+    await update.message.reply_text("Hello! Talk to me or use the menu:", reply_markup=get_main_menu())
 
 if __name__ == '__main__':
-    if not TOKEN or not DATABASE_URL or MI_TELEGRAM_ID == 0: exit(1)
+    if not TOKEN or not DATABASE_URL or MY_TELEGRAM_ID == 0: exit(1)
         
     init_db_pool()
     init_db()
     
-    threading.Thread(target=iniciar_servidor, daemon=True).start()
+    threading.Thread(target=start_server, daemon=True).start()
     app = ApplicationBuilder().token(TOKEN).build()
 
-    zona = ZoneInfo('America/Monterrey')
-    app.job_queue.run_daily(alerta_matutina, time=datetime.time(hour=6, minute=0, tzinfo=zona))
-    app.job_queue.run_daily(alerta_nocturna, time=datetime.time(hour=19, minute=0, tzinfo=zona))
-    app.job_queue.run_daily(alerta_semanal, time=datetime.time(hour=21, minute=0, tzinfo=zona), days=(6,))
+    tz = ZoneInfo('America/Monterrey')
+    app.job_queue.run_daily(morning_alert, time=datetime.time(hour=6, minute=0, tzinfo=tz))
+    app.job_queue.run_daily(night_alert, time=datetime.time(hour=19, minute=0, tzinfo=tz))
+    app.job_queue.run_daily(weekly_alert, time=datetime.time(hour=21, minute=0, tzinfo=tz), days=(6,))
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("deshacer", comando_deshacer))
-    app.add_handler(CommandHandler("exportar", comando_exportar))
-    app.add_handler(CommandHandler("add_cuenta", add_cuenta))
-    app.add_handler(CommandHandler("presupuesto", set_presupuesto))
-    app.add_handler(CommandHandler("recalcular_saldos", recalcular_saldos))
-    app.add_handler(CommandHandler("resumen", comando_resumen))
+    app.add_handler(CommandHandler("undo", command_undo))
+    app.add_handler(CommandHandler("export", command_export))
+    app.add_handler(CommandHandler("add_account", command_add_account))
+    app.add_handler(CommandHandler("budget", command_set_budget))
+    app.add_handler(CommandHandler("recalculate_balances", command_recalculate_balances))
+    app.add_handler(CommandHandler("summary", command_summary))
     
-    conv_edicion = ConversationHandler(
-        entry_points=[CallbackQueryHandler(iniciar_edicion, pattern='^edit_')],
-        states={E_CAMPO: [CallbackQueryHandler(capturar_campo_edicion, pattern='^edcampo_')], E_VALOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, guardar_edicion)]},
-        fallbacks=[CommandHandler('cancelar', lambda u, c: ConversationHandler.END)]
+    conv_edit = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_editing, pattern='^edit_')],
+        states={E_FIELD: [CallbackQueryHandler(capture_edit_field, pattern='^edfield_')], E_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_edit)]},
+        fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
     )
     
-    conv_handler_tarea = ConversationHandler(
-        entry_points=[CallbackQueryHandler(iniciar_registro_tarea, pattern='^tarea_nueva$')],
-        states={T_DESCRIPCION: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_descripcion)], T_TIPO: [CallbackQueryHandler(capturar_tipo, pattern='^tipo_')], T_PRIORIDAD: [CallbackQueryHandler(capturar_prioridad, pattern='^prio_')], T_FECHA: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_fecha)], T_NOTAS: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_notas), CallbackQueryHandler(capturar_notas, pattern='^sin_notas$')]},
-        fallbacks=[CommandHandler('cancelar', cancelar_registro)], per_message=False
+    conv_task = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_task_registration, pattern='^task_new$')],
+        states={T_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, capture_description)], T_TYPE: [CallbackQueryHandler(capture_type, pattern='^typ_')], T_PRIORITY: [CallbackQueryHandler(capture_priority, pattern='^prio_')], T_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, capture_date)], T_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, capture_notes), CallbackQueryHandler(capture_notes, pattern='^no_notes$')]},
+        fallbacks=[CommandHandler('cancel', cancel_registration)], per_message=False
     )
     
-    conv_handler_finanzas = ConversationHandler(
-        entry_points=[CallbackQueryHandler(iniciar_finanzas, pattern='^finanza_gasto$|^finanza_ingreso$')],
-        states={F_AREA: [CallbackQueryHandler(capturar_f_area, pattern='^f_')], F_CONCEPTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_f_concepto)], F_MONTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_f_monto)], F_METODO: [CallbackQueryHandler(capturar_f_metodo, pattern='^f_cta_')], F_FECHA: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_f_fecha)]},
-        fallbacks=[CommandHandler('cancelar', cancelar_registro)], per_message=False
+    conv_finance = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_finance, pattern='^finance_expense$|^finance_income$')],
+        states={F_AREA: [CallbackQueryHandler(capture_f_area, pattern='^f_')], F_CONCEPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, capture_f_concept)], F_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, capture_f_amount)], F_METHOD: [CallbackQueryHandler(capture_f_method, pattern='^f_acc_')], F_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, capture_f_date)]},
+        fallbacks=[CommandHandler('cancel', cancel_registration)], per_message=False
     )
 
-    conv_habitos = ConversationHandler(
-        entry_points=[CallbackQueryHandler(iniciar_registro_habito, pattern='^habito_nuevo$')],
-        states={H_NOMBRE: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_habito)]},
-        fallbacks=[CommandHandler('cancelar', cancelar_registro)]
+    conv_habit = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_habit_registration, pattern='^habit_new$')],
+        states={H_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, capture_habit)]},
+        fallbacks=[CommandHandler('cancel', cancel_registration)], per_message=False
     )
-    
-    conv_servicios = ConversationHandler(
-        entry_points=[CallbackQueryHandler(iniciar_servicio, pattern='^finanza_servicio$')],
+
+    conv_utility = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_utility, pattern='^finance_utility$')],
         states={
-            S_CONCEPTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_s_concepto)],
-            S_MONTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_s_monto)],
-            S_FECHA: [MessageHandler(filters.TEXT & ~filters.COMMAND, capturar_s_fecha)]
+            S_CONCEPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, capture_s_concept)],
+            S_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, capture_s_amount)],
+            S_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, capture_s_date)]
         },
-        fallbacks=[CommandHandler('cancelar', cancelar_registro)]
+        fallbacks=[CommandHandler('cancel', cancel_registration)], per_message=False
     )
 
-    app.add_handler(conv_edicion)
-    app.add_handler(conv_handler_tarea)
-    app.add_handler(conv_handler_finanzas)
-    app.add_handler(conv_habitos)
-    app.add_handler(conv_servicios)
+    app.add_handler(conv_edit)
+    app.add_handler(conv_task)
+    app.add_handler(conv_finance)
+    app.add_handler(conv_habit)
+    app.add_handler(conv_utility)
+    app.add_handler(CallbackQueryHandler(start_editing, pattern='^edit_records$'))
+    app.add_handler(CallbackQueryHandler(button_handler)) 
     
-    app.add_handler(CallbackQueryHandler(manejador_botones)) 
-    
-    app.add_handler(MessageHandler(filters.VOICE, procesar_audio_local))
-    app.add_handler(MessageHandler(filters.PHOTO, procesar_foto_local))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_texto_libre)) 
+    app.add_handler(MessageHandler(filters.VOICE, process_local_audio))
+    app.add_handler(MessageHandler(filters.PHOTO, process_local_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_free_text)) 
 
-    print("🤖 Súper Bot V28 COMPLETO INICIADO: Full Producción con Correcciones Finales Aplicadas.")
+    print("🤖 Executive Bot V28 ENGLISH INITIATED: Full Production Ready with Utilities & Habits.")
     app.run_polling()
