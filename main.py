@@ -1,10 +1,10 @@
 import threading
 import datetime
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler
-from bot.config import TOKEN, DATABASE_URL, MY_TELEGRAM_ID, ALLOWED_USERS, LOCAL_TZ
-from bot.database import init_db_pool
-from bot.handlers import comandos, menus, tareas, finanzas, habitos, edicion
-from bot.services.nlp import init_spacy
+from config import TOKEN, DATABASE_URL, MY_TELEGRAM_ID, ALLOWED_USERS, LOCAL_TZ
+from database import init_db_pool
+from handlers import comandos, menus, tareas, finanzas, habitos, edicion
+from services.nlp import init_spacy
 
 def main():
     if not TOKEN or not DATABASE_URL or MY_TELEGRAM_ID == 0:
