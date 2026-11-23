@@ -1,5 +1,5 @@
 import os
-from zoneinfo import ZoneInfo
+import ZoneInfo
 import logging
 
 TOKEN = os.getenv("BOT_TOKEN")
