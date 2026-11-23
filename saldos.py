@@ -1,4 +1,4 @@
-from bot.database import execute_sql
+from database import execute_sql
 
 def sync_db_balances():
     execute_sql("UPDATE config_accounts SET balance = 0")
