@@ -1,7 +1,7 @@
 import psycopg2
 from psycopg2 import pool
 import logging
-from bot.config import DATABASE_URL
+from config import DATABASE_URL
 
 db_pool = None
 
